@@ -36,8 +36,9 @@ steps using only rainfall as input.
 ### Step-by-step
 
 ```bash
-# 1. Clone / open the project
-cd urban-flood-challenge
+# 1. Clone the repo
+git clone https://github.com/jianwen0414/UrbanFloodBench.git
+cd UrbanFloodBench
 
 # 2. Create a virtual environment
 python -m venv .venv
@@ -84,9 +85,9 @@ FLOOD_DATA_PATH=C:\Users\YourName\data\urban-flood
 ## 3. Project Structure
 
 ```
-urban-flood-challenge/
-├── .venv/                     # Virtual environment (git-ignored)
-├── data/                      # Raw data (contains Models/)
+UrbanFloodBench/                   # ← repo root
+├── .venv/                         # Virtual environment (git-ignored)
+├── data/                          # Raw data (git-ignored, contains Models/)
 │   └── Models/
 │       ├── Model_1/
 │       │   ├── train/
@@ -105,25 +106,30 @@ urban-flood-challenge/
 │       │   │       └── timesteps.csv
 │       │   └── test/   (same structure)
 │       └── Model_2/    (same structure)
-├── src/                       # Core Python package
+├── src/                           # Core Python package
 │   ├── __init__.py
-│   ├── .env                   # FLOOD_DATA_PATH (local filesystem path)
-│   ├── config.py              # Loads .env, exposes RAW_DATA_PATH
-│   ├── dataset.py             # FloodDataset — Universal Lazy Loader
-│   ├── graph_builder.py       # CSV → PyG graph construction
-│   ├── model_1d.py            # Engine A (GCN-GRU for pipes)
-│   ├── model_2d.py            # Engine B (GraphSAGE-GRU for surface)
-│   ├── loss.py                # Standardized RMSE loss
-│   └── baseline_xgb.py       # Tier 0 XGBoost benchmark
+│   ├── .env                       # FLOOD_DATA_PATH (git-ignored)
+│   ├── config.py                  # Loads .env, exposes RAW_DATA_PATH
+│   ├── dataset.py                 # FloodDataset — Universal Lazy Loader
+│   ├── graph_builder.py           # Re-export shim (backward compat)
+│   ├── graph_builder_1d.py        # 1D pipe graph (Member A)
+│   ├── graph_builder_2d.py        # 2D surface mesh graph (Member B)
+│   ├── graph_builder_unified.py   # Coupled HeteroData graph (Member C)
+│   ├── model_1d.py                # Engine A — GCN-GRU (Member A)
+│   ├── model_2d.py                # Engine B — GraphSAGE-GRU (Member B)
+│   ├── model_unified.py           # Engine C — HeteroGNN-GRU (Member C)
+│   ├── loss.py                    # Standardized RMSE loss
+│   └── baseline_xgb.py           # Tier 0 XGBoost benchmark
 ├── tests/
-│   └── test_dataset.py        # Smoke tests for the data loader
-├── experiments/               # Jupyter notebooks
+│   └── test_dataset.py            # Smoke tests for the data loader
+├── experiments/                   # Jupyter notebooks
 │   ├── member_a_playground.ipynb
 │   ├── member_b_playground.ipynb
 │   └── validation_run.ipynb
+├── .gitignore
 ├── requirements.txt
-├── PROJECT_BIBLE.md           # Physics, strategy, dataset encyclopedia
-├── IMPLEMENTATION_PLAN.md     # Execution plan & task distribution
+├── PROJECT_BIBLE.md               # Physics, strategy, dataset encyclopedia
+├── IMPLEMENTATION_PLAN.md         # Execution plan & task distribution
 └── README.md
 ```
 
@@ -187,16 +193,18 @@ entry-point for all downstream modules to access the competition data.
                     └──────────────┬──────────────────────┘
                                    │
                     ┌──────────────▼──────────────────────┐
-                    │        graph_builder.py              │
-                    │  build_1d_graph(sample) → PyG Data   │
-                    │  build_2d_graph(sample) → PyG Data   │
-                    │  build_unified_graph(sample)         │
-                    │          → HeteroData                │
+                    │  graph_builder_1d.py    (Member A)    │
+                    │    build_1d_graph(sample) → Data      │
+                    │  graph_builder_2d.py    (Member B)    │
+                    │    build_2d_graph(sample) → Data      │
+                    │  graph_builder_unified.py (Member C)  │
+                    │    build_unified_graph() → HeteroData │
                     └──────────────┬──────────────────────┘
                                    │
                     ┌──────────────▼──────────────────────┐
-                    │  model_1d.py / model_2d.py           │
-                    │  (Training & Inference)              │
+                    │  model_1d.py      (Engine A)         │
+                    │  model_2d.py      (Engine B)         │
+                    │  model_unified.py (Engine C / Tier 2)│
                     └─────────────────────────────────────┘
 ```
 
@@ -206,7 +214,7 @@ entry-point for all downstream modules to access the competition data.
 |----------|-----|
 | **Lazy loading** | Dynamic CSVs loaded on `__getitem__`, not at init — keeps peak RAM low across 137+ events |
 | **Static caching** | Static files read once per model and reused — zero duplicate I/O or memory |
-| **Separation of concerns** | `dataset.py` handles I/O only; `graph_builder.py` handles topology + feature engineering |
+| **Separation of concerns** | `dataset.py` handles I/O only; `graph_builder_*.py` modules handle topology + feature engineering |
 | **`compute_node_stds()`** | Pre-computes per-node $\sigma_i$ across all training events — feeds directly into `standardized_rmse_loss` |
 | **`split_by_event()`** | Leave-One-Event-Out CV — prevents temporal data leakage |
 | **`collate_fn`** | Custom collator enforcing `batch_size=1` — dictionaries of DataFrames can't be stacked |
@@ -305,21 +313,23 @@ directory tree to exercise every code path.
 
 ## 8. Next Steps — Graph Building (Phase 1, Tasks 1.2–1.4)
 
-With the data loader verified, the next milestone is **`src/graph_builder.py`** — converting the raw DataFrames from `FloodDataset` into PyTorch Geometric `Data` objects.
+With the data loader verified, the next milestone is the **graph builder modules** — converting the raw DataFrames from `FloodDataset` into PyTorch Geometric `Data` objects.
 
-### What needs to happen
+Each graph builder lives in its own file to avoid merge conflicts:
 
-| Task | Owner | Function | Key requirements |
-|------|-------|----------|-----------------|
-| **1.2** | Member A | `build_1d_graph(sample)` | Bidirectional edges (`from_node ↔ to_node`); features: `Relative Depth`, `Capacity`, `Rain` |
-| **1.3** | Member B | `build_2d_graph(sample)` | Soft coupling: compute Euclidean distance from every 2D node to nearest 1D node (`1d2d_connections.csv`); features: Z-scored elevation, roughness, rainfall, `dist_to_drain` |
-| **1.4** | A & B | `build_unified_graph(sample)` | `HeteroData` with explicit 1D↔2D edges for the fallback Unified Engine |
+| Task | Owner | File | Function | Key requirements |
+|------|-------|------|----------|------------------|
+| **1.2** | Member A | `graph_builder_1d.py` | `build_1d_graph(sample)` | Bidirectional edges (`from_node ↔ to_node`); features: `Relative Depth`, `Capacity`, `Rain` |
+| **1.3** | Member B | `graph_builder_2d.py` | `build_2d_graph(sample)` | Soft coupling: Euclidean distance to nearest 1D node; features: Z-scored elevation, roughness, rainfall, `dist_to_drain` |
+| **1.4** | Member C | `graph_builder_unified.py` | `build_unified_graph(sample)` | `HeteroData` with explicit 1D↔2D edges for the fallback Unified Engine |
 
-### How the graph builder consumes FloodDataset
+### How the graph builders consume FloodDataset
 
 ```python
 from src.dataset import FloodDataset
-from src.graph_builder import build_1d_graph, build_2d_graph
+from src.graph_builder_1d import build_1d_graph
+from src.graph_builder_2d import build_2d_graph
+# or use the legacy shim:  from src.graph_builder import build_1d_graph, build_2d_graph
 
 ds = FloodDataset(RAW_DATA_PATH, mode="train")
 sample = ds[0]
@@ -365,11 +375,26 @@ graph_2d = build_2d_graph(sample)
 
 ## 10. Team Responsibilities
 
-| Member | Role | Modules |
-|--------|------|---------|
-| A | 1D Model Engineer | `model_1d.py`, `graph_builder.py` (1D parts) |
-| B | 2D Model Engineer | `model_2d.py`, `graph_builder.py` (2D parts) |
-| C (Lead Architect) | Infrastructure & Pipeline | `dataset.py`, `loss.py`, `config.py`, validation, submission |
+| Member | Role | Modules | Branch |
+|--------|------|---------|--------|
+| A | 1D Model Engineer | `graph_builder_1d.py`, `model_1d.py` | `feat/1d-pipeline` |
+| B | 2D Model Engineer | `graph_builder_2d.py`, `model_2d.py` | `feat/2d-pipeline` |
+| C (Lead Architect) | Infrastructure & Pipeline | `dataset.py`, `loss.py`, `config.py`, `graph_builder_unified.py`, `model_unified.py` | `feat/unified` |
+
+### Git workflow
+
+```
+main                      ← protected, always passes tests
+├── feat/1d-pipeline      ← Member A
+├── feat/2d-pipeline      ← Member B
+└── feat/unified          ← Member C
+```
+
+**Rules:**
+1. Never edit another member's owned files on your branch.
+2. Rebase from `main` often: `git pull --rebase origin main`.
+3. PR into `main` — each PR must pass `python -m tests.test_dataset`.
+4. Shared infrastructure (`dataset.py`, `config.py`, `loss.py`) lives on `main` — only Member C merges to it.
 
 ---
 
