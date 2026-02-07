@@ -1,0 +1,17 @@
+# ── Core ──────────────────────────────────────────────────────────────
+numpy>=1.23
+pandas>=1.5
+torch>=2.0
+python-dotenv>=1.0
+
+# ── Graph Neural Networks ────────────────────────────────────────────
+torch-geometric>=2.4
+# torch-scatter, torch-sparse are installed separately via PyG wheels
+
+# ── Baseline / Boosting ─────────────────────────────────────────────
+xgboost>=1.7
+scikit-learn>=1.2
+
+# ── Utilities ────────────────────────────────────────────────────────
+matplotlib>=3.6
+tqdm>=4.64

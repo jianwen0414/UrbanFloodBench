@@ -1,0 +1,47 @@
+# ── Python ────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+*.egg
+dist/
+build/
+*.whl
+
+# ── Virtual environment ──────────────────────────────────────────────
+.venv/
+venv/
+env/
+
+# ── Dataset (too large for GitHub) ───────────────────────────────────
+data/Models/
+
+# ── Processed / cached artefacts ─────────────────────────────────────
+data/.cache/
+
+# ── Environment secrets ─────────────────────────────────────────────
+src/.env
+
+# ── Jupyter / IPython ────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ── IDE / editor ─────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── OS junk ──────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Model checkpoints & logs (will appear during training) ───────────
+*.pt
+*.pth
+*.ckpt
+runs/
+logs/
+wandb/
