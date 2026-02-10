@@ -13,4 +13,7 @@ Key modules:
     - model_2d: GraphSAGE-GRU surface-mesh model (Engine B).
     - model_unified: HeteroGNN-GRU coupled model (Engine C / Tier 2).
     - loss: Standardized RMSE loss function.
+    - trainer: Production training pipeline (Phase 3, Task 3.1).
+    - validate: Honest validation strategy (Phase 3, Task 3.2).
+    - inference: Submission assembly line (Phase 3, Task 3.3).
 """
