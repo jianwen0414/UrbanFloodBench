@@ -118,18 +118,27 @@ UrbanFloodBench/                   # ← repo root
 │   ├── model_1d.py                # Engine A — GCN-GRU (Member A)
 │   ├── model_2d.py                # Engine B — GraphSAGE-GRU (Member B)
 │   ├── model_unified.py           # Engine C — HeteroGNN-GRU (Member C)
-│   ├── loss.py                    # Standardized RMSE loss
+│   ├── loss.py                    # SRMSE loss suite (§6)
+│   ├── trainer.py                 # Training pipeline (§7)
+│   ├── validate.py                # Validation pipeline (§8)
+│   ├── inference.py               # Submission generator (§9)
 │   └── baseline_xgb.py           # Tier 0 XGBoost benchmark
 ├── tests/
-│   └── test_dataset.py            # Smoke tests for the data loader
+│   ├── test_dataset.py            # Smoke tests for the data loader
+│   ├── test_loss.py               # Loss functions & accumulator
+│   ├── test_unified_graph.py      # Graph builder validation
+│   └── test_unified_model.py      # Model forward/rollout tests
 ├── experiments/                   # Jupyter notebooks
 │   ├── member_a_playground.ipynb
 │   ├── member_b_playground.ipynb
-│   └── validation_run.ipynb
+│   ├── member_c_playground.ipynb  # Full pipeline walkthrough
+│   └── validation_run.ipynb       # LOEO cross-validation
+├── train_production.py            # Standalone production training (§7)
 ├── .gitignore
 ├── requirements.txt
 ├── PROJECT_BIBLE.md               # Physics, strategy, dataset encyclopedia
 ├── IMPLEMENTATION_PLAN.md         # Execution plan & task distribution
+├── DOCUMENTATION.md               # Detailed API docs for each module
 └── README.md
 ```
 
@@ -170,199 +179,48 @@ Relative Depth = water_level − invert_elevation
 
 ---
 
-## 5. The Data Pipeline — `FloodDataset`
+## 5. Core Modules
 
-`src/dataset.py` implements the **Universal Lazy Loader** — the single
-entry-point for all downstream modules to access the competition data.
+Detailed API documentation, architecture diagrams, code examples, and
+parameter references for each module are in
+[DOCUMENTATION.md](DOCUMENTATION.md).
 
-### Architecture
-
-```
-                    ┌─────────────────────────────────────┐
-                    │          FloodDataset                │
-  src/.env ──────►  │  root_dir, mode="train"/"test"      │
-  (FLOOD_DATA_PATH) │                                     │
-                    │  _discover_events()                  │
-                    │    → self.events = [{model_id,       │
-                    │       event_id, model_path, ...}]    │
-                    │                                     │
-                    │  __getitem__(idx)                    │
-                    │    → static (cached per model)       │
-                    │    → dynamic (loaded fresh per event)│
-                    │    → returns Dict[str, DataFrame]    │
-                    └──────────────┬──────────────────────┘
-                                   │
-                    ┌──────────────▼──────────────────────┐
-                    │  graph_builder_1d.py    (Member A)    │
-                    │    build_1d_graph(sample) → Data      │
-                    │  graph_builder_2d.py    (Member B)    │
-                    │    build_2d_graph(sample) → Data      │
-                    │  graph_builder_unified.py (Member C)  │
-                    │    build_unified_graph() → HeteroData │
-                    └──────────────┬──────────────────────┘
-                                   │
-                    ┌──────────────▼──────────────────────┐
-                    │  model_1d.py      (Engine A)         │
-                    │  model_2d.py      (Engine B)         │
-                    │  model_unified.py (Engine C / Tier 2)│
-                    └─────────────────────────────────────┘
-```
-
-### Key design decisions
-
-| Decision | Why |
-|----------|-----|
-| **Lazy loading** | Dynamic CSVs loaded on `__getitem__`, not at init — keeps peak RAM low across 137+ events |
-| **Static caching** | Static files read once per model and reused — zero duplicate I/O or memory |
-| **Separation of concerns** | `dataset.py` handles I/O only; `graph_builder_*.py` modules handle topology + feature engineering |
-| **`compute_node_stds()`** | Pre-computes per-node $\sigma_i$ across all training events — feeds directly into `standardized_rmse_loss` |
-| **`split_by_event()`** | Leave-One-Event-Out CV — prevents temporal data leakage |
-| **`collate_fn`** | Custom collator enforcing `batch_size=1` — dictionaries of DataFrames can't be stacked |
-
-### Quick usage
-
-```python
-from src.config import RAW_DATA_PATH
-from src.dataset import FloodDataset
-
-# ── 1. Load the dataset ─────────────────────────────
-ds = FloodDataset(RAW_DATA_PATH, mode="train")
-print(ds)  # FloodDataset(..., events=137)
-
-# ── 2. Grab a single event ──────────────────────────
-sample = ds[0]
-# sample keys: model_id, event_id, static_1d_nodes,
-#              dynamic_1d_nodes, edge_index_1d, ...
-
-# ── 3. Filter by model ──────────────────────────────
-ds_m1 = ds.filter_by_model("1")     # 68 events
-ds_m2 = ds.filter_by_model("2")     # 69 events
-
-# ── 4. Leave-One-Event-Out split ────────────────────
-train_ds, val_ds = ds.split_by_event("96", model_id="1")
-# train: 67 events | val: 1 event — zero leakage
-
-# ── 5. Compute per-node stds for the loss function ──
-stds = ds.compute_node_stds(model_id="1")
-# stds["1"]["1d"].shape == (17,)  — one σ per 1D node
-# stds["1"]["2d"].shape == (3716,) — one σ per 2D node
-
-# ── 6. Use with DataLoader ──────────────────────────
-from torch.utils.data import DataLoader
-
-loader = DataLoader(
-    ds,
-    batch_size=1,                          # MUST be 1
-    collate_fn=FloodDataset.collate_fn,    # REQUIRED
-    shuffle=True,
-)
-for sample in loader:
-    # sample is a plain dict — pass to graph_builder
-    pass
-```
+| Module | Purpose | Key entry-point |
+|--------|---------|------------------|
+| `dataset.py` | Universal lazy loader for all competition data | `FloodDataset(root, mode)` |
+| `loss.py` | SRMSE loss suite matching the leaderboard metric | `FloodLoss`, `SRMSEAccumulator` |
+| `trainer.py` | Full training lifecycle with curriculum learning | `UnifiedTrainer(cfg).train()` |
+| `validate.py` | Leaderboard-mirroring validation pipeline | `ValidationRunner.validate_holdout()` |
+| `inference.py` | Submission CSV generation & sanity checks | `SubmissionGenerator.from_checkpoint()` |
+| `graph_builder_*.py` | Per-engine graph construction from raw CSVs | `build_1d_graph()`, `build_2d_graph()`, `build_unified_graph()` |
 
 ---
 
-## 6. Evaluation Metric — Standardized RMSE
-
-$$
-\text{SRMSE} = \frac{1}{N} \sum_{i=1}^{N}
-\frac{\sqrt{\frac{1}{T}\sum_{t=1}^{T}(y_{it} - \hat{y}_{it})^2}}
-{\sigma_i}
-$$
-
-Because the metric weights every node equally *after* normalising by
-its $\sigma_i$, dry nodes (σ ≈ 0) can dominate the score. The training
-loss in `src/loss.py` handles this via clamped inverse-variance weights:
-
-```python
-from src.loss import standardized_rmse_loss
-
-# node_stds: Tensor of shape (N,) from compute_node_stds()
-loss = standardized_rmse_loss(pred, target, node_stds, clamp_weights=100.0)
-```
-
----
-
-## 7. Testing the Loader
+## 6. Testing
 
 ```bash
 # From the project root, with venv activated:
 python -m tests.test_dataset
+python -m tests.test_loss
+python -m tests.test_unified_graph
+python -m tests.test_unified_model
 ```
 
-The test suite runs **10 checks** covering:
+### Test suite summary
 
-| # | Test | Validates |
-|---|------|-----------|
-| 1 | Event Discovery | Constructor finds all Model/Event folders |
-| 2 | ID Accessors | `get_model_ids()`, `get_event_ids()` return correct values |
-| 3 | `__getitem__` | All 14 expected keys present with valid DataFrames |
-| 4 | Static Caching | Repeated access returns the *same object* (no duplication) |
-| 5 | `filter_by_model()` | Correctly isolates events for one model |
-| 6 | `split_by_event()` | Train/Val split with zero leakage |
-| 7 | `compute_node_stds()` | Returns one σ per node (not a scalar), all finite |
-| 8 | DataLoader | `collate_fn` works with `batch_size=1` |
-| 9 | Physics Sanity | `Capacity = surface_elevation − invert_elevation ≥ 0` |
-| 10 | Edge Cases | `IndexError` on out-of-bounds access |
+| File | Tests | Validates |
+|------|-------|-----------|
+| `test_dataset.py` | 10 | Event discovery, `__getitem__`, caching, filtering, splitting, stds, DataLoader, physics sanity, edge cases |
+| `test_loss.py` | — | Loss functions, metrics, accumulator, push-forward loss, node-type balancing |
+| `test_unified_graph.py` | — | Graph builder produces valid `HeteroData`, correct edge types, feature dimensions |
+| `test_unified_model.py` | — | Model forward pass, rollout, push-forward rollout, hidden state shapes |
 
 If no real data is present, the test auto-generates a synthetic
 directory tree to exercise every code path.
 
 ---
 
-## 8. Next Steps — Graph Building (Phase 1, Tasks 1.2–1.4)
-
-With the data loader verified, the next milestone is the **graph builder modules** — converting the raw DataFrames from `FloodDataset` into PyTorch Geometric `Data` objects.
-
-Each graph builder lives in its own file to avoid merge conflicts:
-
-| Task | Owner | File | Function | Key requirements |
-|------|-------|------|----------|------------------|
-| **1.2** | Member A | `graph_builder_1d.py` | `build_1d_graph(sample)` | Bidirectional edges (`from_node ↔ to_node`); features: `Relative Depth`, `Capacity`, `Rain` |
-| **1.3** | Member B | `graph_builder_2d.py` | `build_2d_graph(sample)` | Soft coupling: Euclidean distance to nearest 1D node; features: Z-scored elevation, roughness, rainfall, `dist_to_drain` |
-| **1.4** | Member C | `graph_builder_unified.py` | `build_unified_graph(sample)` | `HeteroData` with explicit 1D↔2D edges for the fallback Unified Engine |
-
-### How the graph builders consume FloodDataset
-
-```python
-from src.dataset import FloodDataset
-from src.graph_builder_1d import build_1d_graph
-from src.graph_builder_2d import build_2d_graph
-# or use the legacy shim:  from src.graph_builder import build_1d_graph, build_2d_graph
-
-ds = FloodDataset(RAW_DATA_PATH, mode="train")
-sample = ds[0]
-
-# Graph builder receives the full sample dict:
-graph_1d = build_1d_graph(sample)
-# graph_1d.x          → node features [N_1d, F]
-# graph_1d.edge_index → [2, E_1d] (bidirectional)
-# graph_1d.y          → water_level targets [T, N_1d]
-
-graph_2d = build_2d_graph(sample)
-# graph_2d.x          → node features [N_2d, F]
-# graph_2d.edge_index → [2, E_2d]
-# graph_2d.y          → water_level targets [T, N_2d]
-```
-
-### Data the graph builder has access to (from `sample` dict)
-
-**For 1D graph:**
-- `sample["static_1d_nodes"]` — `node_idx, depth, invert_elevation, surface_elevation, base_area`
-- `sample["dynamic_1d_nodes"]` — `timestep, node_idx, water_level, inlet_flow` (long format)
-- `sample["edge_index_1d"]` — `from_node, to_node` (must be made bidirectional)
-- `sample["static_1d_edges"]` — `diameter, roughness, slope, length`
-
-**For 2D graph:**
-- `sample["static_2d_nodes"]` — `node_idx, area, roughness, min_elevation, elevation, aspect, curvature, flow_accumulation`
-- `sample["dynamic_2d_nodes"]` — `timestep, node_idx, rainfall, water_level, water_volume` (long format)
-- `sample["edge_index_2d"]` — `from_node, to_node`
-- `sample["1d2d_conn"]` — `node_1d, node_2d` (for computing `dist_to_drain`)
-
----
-
-## 9. Strategy Summary — Twin-Engine Hydra
+## 7. Strategy Summary — Twin-Engine Hydra
 
 | Tier | Model | Architecture | Purpose |
 |------|-------|-------------|---------|
@@ -373,13 +231,26 @@ graph_2d = build_2d_graph(sample)
 
 ---
 
-## 10. Team Responsibilities
+## 8. Team Responsibilities
 
 | Member | Role | Modules | Branch |
 |--------|------|---------|--------|
 | A | 1D Model Engineer | `graph_builder_1d.py`, `model_1d.py` | `feat/1d-pipeline` |
 | B | 2D Model Engineer | `graph_builder_2d.py`, `model_2d.py` | `feat/2d-pipeline` |
-| C (Lead Architect) | Infrastructure & Pipeline | `dataset.py`, `loss.py`, `config.py`, `graph_builder_unified.py`, `model_unified.py` | `feat/unified` |
+| C (Lead Architect) | Infrastructure & Pipeline | `dataset.py`, `loss.py`, `config.py`, `graph_builder_unified.py`, `model_unified.py`, `trainer.py`, `validate.py`, `inference.py` | `feat/unified` |
+
+### Shared infrastructure you can import directly
+
+Members A & B: these modules are **ready for use** in your decoupled engines. You do **not** need to rewrite any of them.
+
+| Module | What you get | Import example |
+|--------|-------------|----------------|
+| `loss.py` | `FloodLoss`, `standardized_rmse_metric`, `SRMSEAccumulator`, `per_node_loss_breakdown` | `from src.loss import FloodLoss` |
+| `trainer.py` | `TrainConfig`, `TeacherForcingScheduler`, `EarlyStopping`, `TrainingHistory`, `save_checkpoint`, `load_checkpoint` | `from src.trainer import TrainConfig, EarlyStopping` |
+| `validate.py` | `ValidationResult`, `extract_predictions`, `check_leaderboard_correlation` | `from src.validate import extract_predictions` |
+| `inference.py` | `_build_submission_rows_vectorized`, `ensemble_predict_event` | `from src.inference import _build_submission_rows_vectorized` |
+| `dataset.py` | `FloodDataset` (data loading, splitting, σ computation) | `from src.dataset import FloodDataset` |
+| `config.py` | `RAW_DATA_PATH`, `PROJECT_ROOT` | `from src.config import RAW_DATA_PATH` |
 
 ### Git workflow
 
@@ -394,8 +265,8 @@ main                      ← protected, always passes tests
 1. Never edit another member's owned files on your branch.
 2. Rebase from `main` often: `git pull --rebase origin main`.
 3. PR into `main` — each PR must pass `python -m tests.test_dataset`.
-4. Shared infrastructure (`dataset.py`, `config.py`, `loss.py`) lives on `main` — only Member C merges to it.
+4. Shared infrastructure (`dataset.py`, `config.py`, `loss.py`, `trainer.py`, `validate.py`, `inference.py`) lives on `main` — only Member C merges to it.
 
 ---
 
-*Last updated: 2026-02-07*
+*Last updated: 2026-02-11*

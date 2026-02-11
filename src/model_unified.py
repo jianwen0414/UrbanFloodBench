@@ -20,6 +20,21 @@ Separating surcharge from drainage lets the model learn distinct
 message-passing functions for pressure-driven overflow vs gravity-driven
 inlet flow — they are fundamentally different physics.
 
+Target Space (v4 — Depth-Based)
+-------------------------------
+The model predicts **depth** (water height above a physical reference):
+  - 1D: ``depth = WSE − invert_elevation``  (height above pipe invert)
+  - 2D: ``depth = WSE − min_elevation``     (water depth above ground)
+
+This eliminates the train-inference mismatch that existed in the old
+anomaly-based approach (WSE − WSE(t=0)), where dynamic features were
+computed differently during teacher forcing vs student forcing.  Now:
+  - 1D dynamic features: ``relative_depth = depth`` (identical to target),
+    ``fill_ratio = depth / capacity``
+  - 2D dynamic features: ``rainfall, water_depth = depth, water_volume``
+
+Recovery at inference: ``WSE = predicted_depth + elevation_reference``
+
 Data Flow (single timestep)
 ---------------------------
 1. **Feature Assembly** — concatenate static node features (from
@@ -500,32 +515,41 @@ class UnifiedFloodModel(nn.Module):
         for gnn_layer in self.gnn_layers:
             x_dict = gnn_layer(x_dict, edge_index_dict)
 
-        # ── 5. Temporal GRU ───────────────────────────────────────
+        # ── 5. Temporal GRU (forced fp32) ──────────────────────────
+        # GRU hidden states persist across the full rollout.  Under
+        # fp16 autocast they can drift beyond 65504 and overflow to
+        # NaN.  Force fp32 for GRU + prediction heads.  The GNN
+        # layers above still benefit from fp16.
         h_1d_new: List[Tensor] = []
         h_2d_new: List[Tensor] = []
 
-        gru_input_1d = x_dict["node_1d"]
-        gru_input_2d = x_dict["node_2d"]
+        gru_input_1d = x_dict["node_1d"].float()
+        gru_input_2d = x_dict["node_2d"].float()
 
-        for layer_idx in range(self.num_gru_layers):
-            h_1d_layer = self.gru_1d[layer_idx](gru_input_1d, h_1d[layer_idx])
-            h_2d_layer = self.gru_2d[layer_idx](gru_input_2d, h_2d[layer_idx])
+        with torch.amp.autocast(device.type, enabled=False):
+            for layer_idx in range(self.num_gru_layers):
+                h_1d_layer = self.gru_1d[layer_idx](
+                    gru_input_1d, h_1d[layer_idx].float()
+                )
+                h_2d_layer = self.gru_2d[layer_idx](
+                    gru_input_2d, h_2d[layer_idx].float()
+                )
 
-            h_1d_new.append(h_1d_layer)
-            h_2d_new.append(h_2d_layer)
+                h_1d_new.append(h_1d_layer)
+                h_2d_new.append(h_2d_layer)
 
-            # Inter-layer dropout (only between stacked layers)
-            if layer_idx < self.num_gru_layers - 1:
-                gru_input_1d = self.gru_dropout(h_1d_layer)
-                gru_input_2d = self.gru_dropout(h_2d_layer)
+                # Inter-layer dropout (only between stacked layers)
+                if layer_idx < self.num_gru_layers - 1:
+                    gru_input_1d = self.gru_dropout(h_1d_layer)
+                    gru_input_2d = self.gru_dropout(h_2d_layer)
 
-        # Normalise final hidden state for stable autoregressive rollout
-        h_final_1d = self.gru_norm_1d(h_1d_new[-1])
-        h_final_2d = self.gru_norm_2d(h_2d_new[-1])
+            # Normalise final hidden state for stable autoregressive rollout
+            h_final_1d = self.gru_norm_1d(h_1d_new[-1])
+            h_final_2d = self.gru_norm_2d(h_2d_new[-1])
 
-        # ── 6. Prediction Heads ───────────────────────────────────
-        pred_1d = self.head_1d(h_final_1d)                  # [N_1d]
-        pred_2d = self.head_2d(h_final_2d)                  # [N_2d]
+            # ── 6. Prediction Heads ───────────────────────────────
+            pred_1d = self.head_1d(h_final_1d)              # [N_1d]
+            pred_2d = self.head_2d(h_final_2d)              # [N_2d]
 
         return pred_1d, pred_2d, h_1d_new, h_2d_new
 
@@ -623,8 +647,21 @@ class UnifiedFloodModel(nn.Module):
                         override_dynamic_2d=dyn_2d,
                     )
 
+            # Clamp predictions to physically reasonable depth ranges.
+            # 1D depth: can be slightly negative (pipe below invert) but
+            # bounded by max pipe capacity (~25m) + surcharge margin.
+            # 2D depth: physically >= 0 (water on surface), upper bounded.
+            pred_1d = pred_1d.clamp(-2.0, 30.0)
+            pred_2d = pred_2d.clamp(-0.5, 15.0)
+
             all_preds_1d[t] = pred_1d
             all_preds_2d[t] = pred_2d
+
+            # Early NaN detection: break immediately to avoid wasting
+            # compute on a doomed rollout.  The trainer's NaN guard
+            # will skip this event.
+            if torch.isnan(pred_1d).any() or torch.isnan(pred_2d).any():
+                break
 
         return all_preds_1d, all_preds_2d
 
@@ -719,10 +756,21 @@ class UnifiedFloodModel(nn.Module):
                     override_dynamic_2d=dyn_2d,
                 )
 
+            # Clamp to physically reasonable depth ranges.
+            pred_1d = pred_1d.clamp(-2.0, 30.0)
+            pred_2d = pred_2d.clamp(-0.5, 15.0)
+
             preds_1d[k] = pred_1d
             preds_2d[k] = pred_2d
-            prev_pred_1d = pred_1d.detach()  # stop gradient for feedback
-            prev_pred_2d = pred_2d.detach()
+            # Allow gradient flow through AR loop (BPTT) so the model
+            # can learn error-correcting dynamics.  Combined with
+            # gradient clipping (norm=1.0), this is stable.
+            prev_pred_1d = pred_1d
+            prev_pred_2d = pred_2d
+
+            # Early NaN detection
+            if torch.isnan(pred_1d).any() or torch.isnan(pred_2d).any():
+                break
 
         # Extract targets
         end_t = start_t + K
@@ -744,21 +792,24 @@ class UnifiedFloodModel(nn.Module):
     ) -> Tuple[Tensor, Tensor]:
         """Build dynamic input features from model predictions.
 
-        When the model is running autoregressively (no ground truth),
-        we need to construct the dynamic feature vectors from the
-        model's own predictions.
+        **Depth-based (v4):** The model predicts *depth* directly:
+          - 1D: depth = WSE − invert_elevation
+          - 2D: depth = WSE − min_elevation
+
+        This is a major simplification over the old anomaly-based
+        approach: the predicted depth IS the dynamic feature.  No
+        anomaly→absolute→relative conversion chain needed, which
+        eliminates the train-inference mismatch bug.
 
         1D Dynamic features: [relative_depth, fill_ratio, inlet_flow]
-          - ``relative_depth = predicted_water_level − invert_elev``
-          - ``fill_ratio = clamp(relative_depth / capacity, 0, 5)``
-          - ``inlet_flow``: use ground_truth rainfall-derived proxy
-            or zero (not available at test time beyond spinup)
+          - ``relative_depth = predicted_depth``  (identical to target)
+          - ``fill_ratio = clamp(depth / capacity, 0, 5)``
+          - ``inlet_flow``: ground truth if available, else zero
 
-        2D Dynamic features: [rainfall, water_level, water_volume]
+        2D Dynamic features: [rainfall, water_depth, water_volume]
           - ``rainfall``: always available from data (known forcing)
-          - ``water_level``: from model prediction
-          - ``water_volume``: approximated from water_level × area
-            (or use 0.0 as a safe default)
+          - ``water_depth = predicted_depth``  (identical to target)
+          - ``water_volume = area × relu(depth)``
 
         Parameters
         ----------
@@ -766,9 +817,9 @@ class UnifiedFloodModel(nn.Module):
         t : int
             Current timestep.
         prev_pred_1d : Tensor [N_1d]
-            Model's water level prediction from the previous step.
+            Model's *depth* prediction from the previous step.
         prev_pred_2d : Tensor [N_2d]
-            Model's water level prediction from the previous step.
+            Model's *depth* prediction from the previous step.
 
         Returns
         -------
@@ -778,14 +829,21 @@ class UnifiedFloodModel(nn.Module):
         """
         device = prev_pred_1d.device
 
+        # ── Force fp32 for physics computations ────────────────
+        prev_pred_1d = prev_pred_1d.float()
+        prev_pred_2d = prev_pred_2d.float()
+
         # ── 1D feedback ───────────────────────────────────────────
-        invert_elev = data["node_1d"].invert_elev.to(device)  # [N_1d]
-        capacity = data["node_1d"].capacity.to(device)         # [N_1d]
+        # Depth IS relative_depth — no conversion needed.
+        capacity = data["node_1d"].capacity.to(device).float()  # [N_1d]
 
-        relative_depth = prev_pred_1d - invert_elev
-        fill_ratio = torch.clamp(relative_depth / capacity, min=0.0, max=5.0)
+        relative_depth = prev_pred_1d  # depth = WSE - invert_elev
+        fill_ratio = torch.clamp(
+            relative_depth / capacity.clamp(min=1e-3),
+            min=0.0, max=5.0,
+        )
 
-        # inlet_flow: use ground truth if available (it's driven by
+        # inlet_flow: use ground truth if available (driven by
         # rainfall which is known), otherwise zero
         T_avail = data["node_1d"].dynamic.size(0)
         if t < T_avail:
@@ -803,18 +861,15 @@ class UnifiedFloodModel(nn.Module):
         else:
             rainfall = torch.zeros(data["node_2d"].num_nodes, device=device)
 
-        water_level_2d = prev_pred_2d
+        # water_depth = predicted depth (identical to target space)
+        water_depth = prev_pred_2d
 
-        # water_volume approximation: use area × (water_level - min_elev)
-        # This is a rough physical proxy.  The model learns to correct.
-        # area is the first static feature for 2D (index 0)
-        area_2d = data["node_2d"].x[:, 0].to(device)
-        min_elev_2d = data["node_2d"].x[:, 2].to(device)  # index 2
-        water_depth_approx = F.relu(water_level_2d - min_elev_2d)
-        water_volume_approx = area_2d * water_depth_approx
+        # water_volume = area × depth (depth must be non-negative)
+        area_2d = data["node_2d"].x[:, 0].to(device).float()
+        water_volume_approx = area_2d * F.relu(prev_pred_2d)
 
         dyn_2d = torch.stack(
-            [rainfall, water_level_2d, water_volume_approx], dim=-1
+            [rainfall, water_depth, water_volume_approx], dim=-1
         )
 
         return dyn_1d, dyn_2d

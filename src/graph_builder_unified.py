@@ -125,7 +125,7 @@ _2D_STATIC_FEATURE_NAMES: List[str] = [
 
 _2D_DYNAMIC_FEATURE_NAMES: List[str] = [
     "rainfall",
-    "water_level",
+    "water_depth",
     "water_volume",
 ]
 
@@ -376,11 +376,19 @@ def _build_1d_dynamic_features(
     n_nodes: int,
     invert_elev: torch.Tensor,
     capacity: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute 1D dynamic features and targets.
 
+    **Depth-based targets (v4 — fixes anomaly bug):**
+    The model predicts *relative depth* (WSE − invert_elevation)
+    instead of anomalies (WSE − WSE(t=0)).  This is physically
+    grounded: relative depth is always the water height above the
+    pipe invert, and the same conversion applies during both teacher
+    forcing and student forcing — eliminating the train-inference
+    feature mismatch that caused autoregressive collapse.
+
     Dynamic features per timestep:
-      - relative_depth = water_level − invert_elevation
+      - relative_depth = water_level − invert_elevation  (= target)
       - fill_ratio     = clamp(relative_depth / capacity, 0, 5)
       - inlet_flow
 
@@ -395,14 +403,27 @@ def _build_1d_dynamic_features(
     Returns
     -------
     dynamic : Tensor [T, N_1d, 3]
-    targets : Tensor [T, N_1d]
+    targets : Tensor [T, N_1d]  — **depth** targets (WSE − invert_elev)
+    elevation_ref_1d : Tensor [N_1d] — invert_elevation (for WSE recovery)
     """
-    # Extract raw water_level and inlet_flow
-    targets = _extract_targets(
+    # Extract raw water_level (absolute WSE)
+    targets_raw = _extract_targets(
         dynamic_nodes, n_nodes,
         timestep_col="timestep", node_col="node_idx",
         target_col="water_level",
     )  # [T, N]
+
+    # ── Target: depth = WSE − invert_elevation ────────────────────
+    # Physically grounded: depth is the water height above the pipe
+    # invert.  This replaces the old anomaly approach (WSE − WSE(0))
+    # which caused a critical train-inference mismatch in the dynamic
+    # features (relative_depth was computed from anomaly during TF
+    # but from absolute WSE during student forcing — a ~300m offset
+    # for Model_1).
+    #
+    # Recovery at inference: WSE = predicted_depth + invert_elevation
+    elevation_ref_1d = invert_elev.clone()  # [N_1d]
+    targets = targets_raw - invert_elev.unsqueeze(0)  # [T, N_1d] = depth
 
     # Build raw dynamic columns (inlet_flow)
     raw_cols = ["inlet_flow"]
@@ -412,11 +433,14 @@ def _build_1d_dynamic_features(
         value_cols=raw_cols,
     )  # [T, N, 1]
 
-    # Compute derived physics features
-    # relative_depth: how high the water is above the pipe invert [T, N]
-    relative_depth = targets - invert_elev.unsqueeze(0)  # broadcast [1, N]
+    # Compute derived physics features from depth
+    # relative_depth = depth (target IS relative_depth — no conversion needed)
+    relative_depth = targets  # [T, N]
     # fill_ratio: fraction of capacity used; >1 indicates surcharge [T, N]
-    fill_ratio = torch.clamp(relative_depth / capacity.unsqueeze(0), min=0.0, max=5.0)
+    fill_ratio = torch.clamp(
+        relative_depth / capacity.unsqueeze(0).clamp(min=1e-3),
+        min=0.0, max=5.0,
+    )
 
     # Stack: [T, N, 3] = [relative_depth, fill_ratio, inlet_flow]
     dynamic = torch.stack(
@@ -424,7 +448,7 @@ def _build_1d_dynamic_features(
         dim=-1,
     )
 
-    return dynamic, targets
+    return dynamic, targets, elevation_ref_1d
 
 
 # =====================================================================
@@ -486,21 +510,35 @@ def _build_2d_static_features(
 def _build_2d_dynamic_features(
     dynamic_nodes: pd.DataFrame,
     n_nodes: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    min_elev: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute 2D dynamic features and targets.
 
-    Dynamic features per timestep: rainfall, water_level, water_volume.
+    **Depth-based targets (v4):**
+    Target = WSE − min_elevation = water depth above ground.
+    Dynamic features: rainfall, water_depth, water_volume.
+    The water_depth feature is identical to the target — no
+    conversion needed during feedback, eliminating the risk of
+    train-inference mismatch.
 
     Returns
     -------
     dynamic : Tensor [T, N_2d, 3]
-    targets : Tensor [T, N_2d]
+    targets : Tensor [T, N_2d]     — **depth** targets (WSE − min_elev)
+    elevation_ref_2d : Tensor [N_2d] — min_elevation (for WSE recovery)
     """
-    targets = _extract_targets(
+    targets_raw = _extract_targets(
         dynamic_nodes, n_nodes,
         timestep_col="timestep", node_col="node_idx",
         target_col="water_level",
     )
+
+    # ── Target: depth = WSE − min_elevation ───────────────────────
+    # Physically grounded: depth is the water height above the lowest
+    # point of the cell.  depth >= 0 is a valid physical constraint.
+    # Recovery at inference: WSE = predicted_depth + min_elevation
+    elevation_ref_2d = min_elev.clone()  # [N_2d]
+    targets = targets_raw - min_elev.unsqueeze(0)  # [T, N_2d] = depth
 
     dynamic = _pivot_dynamic_to_tensor(
         dynamic_nodes, n_nodes,
@@ -508,7 +546,11 @@ def _build_2d_dynamic_features(
         value_cols=["rainfall", "water_level", "water_volume"],
     )
 
-    return dynamic, targets
+    # ── Convert water_level dynamic feature to depth ──────────────
+    # Feature index 1 = water_level → water_depth = WSE − min_elev
+    dynamic[:, :, 1] = dynamic[:, :, 1] - min_elev.unsqueeze(0)
+
+    return dynamic, targets, elevation_ref_2d
 
 
 # =====================================================================
@@ -789,13 +831,15 @@ def build_unified_graph(
     # 1.  1D node features
     # ------------------------------------------------------------------
     x_1d, invert_elev, capacity = _build_1d_static_features(static_1d_nodes)
-    dyn_1d, y_1d = _build_1d_dynamic_features(dynamic_1d, n_1d, invert_elev, capacity)
+    dyn_1d, y_1d, elevation_ref_1d = _build_1d_dynamic_features(dynamic_1d, n_1d, invert_elev, capacity)
 
     # ------------------------------------------------------------------
     # 2.  2D node features
     # ------------------------------------------------------------------
     x_2d = _build_2d_static_features(static_2d_nodes)
-    dyn_2d, y_2d = _build_2d_dynamic_features(dynamic_2d, n_2d)
+    # Extract min_elevation for depth-based targets (index 2 in x_2d)
+    min_elev_2d = x_2d[:, 2].clone()  # min_elevation
+    dyn_2d, y_2d, elevation_ref_2d = _build_2d_dynamic_features(dynamic_2d, n_2d, min_elev_2d)
 
     # ------------------------------------------------------------------
     # 3.  Synchronise timestep counts
@@ -841,16 +885,18 @@ def build_unified_graph(
 
     # ---- 1D nodes ----------------------------------------------------
     data["node_1d"].x = x_1d                       # [N_1d, 5]
-    data["node_1d"].y = y_1d                       # [T, N_1d]
+    data["node_1d"].y = y_1d                       # [T, N_1d]  (depth targets)
     data["node_1d"].dynamic = dyn_1d               # [T, N_1d, 3]
     data["node_1d"].invert_elev = invert_elev      # [N_1d]
     data["node_1d"].capacity = capacity             # [N_1d]
+    data["node_1d"].baseline = elevation_ref_1d     # [N_1d] invert_elev (for WSE recovery)
     data["node_1d"].num_nodes = n_1d
 
     # ---- 2D nodes ----------------------------------------------------
     data["node_2d"].x = x_2d                       # [N_2d, 9]
-    data["node_2d"].y = y_2d                       # [T, N_2d]
+    data["node_2d"].y = y_2d                       # [T, N_2d]  (depth targets)
     data["node_2d"].dynamic = dyn_2d               # [T, N_2d, 3]
+    data["node_2d"].baseline = elevation_ref_2d     # [N_2d] min_elev (for WSE recovery)
     data["node_2d"].num_nodes = n_2d
 
     # ---- Pipe edges (1D internal) ------------------------------------

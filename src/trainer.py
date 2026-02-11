@@ -49,7 +49,17 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch import Tensor
-from torch.cuda.amp import GradScaler, autocast
+from torch.cuda.amp import GradScaler
+
+# Use torch.amp.autocast (new API) with fallback to torch.cuda.amp.autocast (old)
+try:
+    from torch.amp import autocast as _autocast
+    def _amp_context(device_type: str, enabled: bool):
+        return _autocast(device_type=device_type, enabled=enabled)
+except ImportError:
+    from torch.cuda.amp import autocast as _cuda_autocast
+    def _amp_context(device_type: str, enabled: bool):
+        return _cuda_autocast(enabled=enabled)
 
 try:
     from tqdm import tqdm
@@ -87,7 +97,10 @@ class TrainConfig:
     # ── Data ──────────────────────────────────────────────────────
     data_root: str = "data"
     model_ids: List[str] = field(default_factory=lambda: ["1", "2"])
-    val_event_id: str = "4"  # Leave-One-Event-Out
+    # ── Validation ────────────────────────────────────────────────
+    val_event_id: str = "3,9,15"  # comma-separated event IDs present in BOTH models
+    # These 3 events exist in both Model_1 and Model_2 train splits,
+    # giving 6 total val events (3 per model) for a stable SRMSE signal.
     mode: str = "train"
 
     # ── Architecture ──────────────────────────────────────────────
@@ -109,22 +122,56 @@ class TrainConfig:
     tf_min_ratio: float = 0.0      # final teacher forcing ratio
 
     # ── Push-Forward Training ─────────────────────────────────────
-    pushforward_K: int = 10        # rollout window length
+    pushforward_K: int = 30        # target rollout length (or max K for progressive)
     temporal_scheme: Literal["uniform", "linear", "exponential"] = "linear"
     use_push_forward: bool = True
+
+    # ── Progressive K Curriculum (anti-AR-collapse) ───────────────
+    # Start training with short rollouts (K_start), then increase
+    # linearly to pushforward_K over K_ramp_epochs.  This lets the
+    # model master short-horizon prediction before being challenged
+    # on longer trajectories.  Without this, K=15 from epoch 0
+    # floods the early loss with uninformative late-step errors.
+    progressive_K: bool = True
+    K_start: int = 3               # initial rollout length
+    K_ramp_epochs: int = 30        # epochs to reach full pushforward_K
+
+    # ── Randomized Spinup (exposure bias mitigation) ──────────────
+    # During training, randomize the spinup length between
+    # spinup_min and spinup_max.  This presents the model with
+    # varying qualities of GRU hidden state, preventing it from
+    # overfitting to "perfect 10-step spinup" conditions that
+    # differ from validation when errors accumulate.
+    randomize_spinup: bool = True
+    spinup_min: int = 3
+    spinup_max: int = 10
+
+    # ── Training Noise Injection (Exposure Bias Mitigation) ───────
+    # Disabled by default: previous runs showed it was counterproductive
+    # because it corrupts training signal during the critical early
+    # learning phase.  Progressive K + randomized spinup achieves
+    # the same goal more cleanly.
+    training_noise_std: float = 0.0
 
     # ── Loss ──────────────────────────────────────────────────────
     loss_variant: Literal["mse", "huber"] = "mse"
     huber_delta: float = 1.0
-    clamp_weights: float = 100.0
+    clamp_weights: float = 10.0   # was 100; lower prevents dry-node weight explosion
     alpha: float = 0.5  # 1D/2D balance
 
     # ── LR Scheduler ─────────────────────────────────────────────
-    scheduler: Literal["cosine", "plateau", "none"] = "cosine"
+    scheduler: Literal["cosine", "plateau", "cosine_warm", "onecycle", "none"] = "cosine"
     cosine_T_max: Optional[int] = None  # defaults to epochs
     cosine_eta_min: float = 1e-6
+    cosine_warm_T0: int = 15       # period for first restart (CosineWarmRestarts)
+    cosine_warm_T_mult: int = 2    # multiply period after each restart
     plateau_patience: int = 5
     plateau_factor: float = 0.5
+    # OneCycleLR: single aggressive cycle with warmup + cosine decay.
+    # Superior to cosine_warm for our setup because it avoids the
+    # destructive warm restarts that reset learning midway.
+    onecycle_pct_start: float = 0.3   # fraction of epochs for LR warmup
+    onecycle_div_factor: float = 25.0 # initial_lr = max_lr / div_factor
 
     # ── Early Stopping ────────────────────────────────────────────
     early_stop_patience: int = 15
@@ -389,10 +436,19 @@ def _train_one_event_unified(
     tf_ratio: float,
     device: torch.device,
     scaler: Optional[GradScaler] = None,
+    effective_K: Optional[int] = None,
 ) -> Tuple[float, Dict[str, float]]:
     """Train on a single event using the Unified HeteroGNN.
 
     Supports both single-step and push-forward training modes.
+    Uses progressive K curriculum and randomized spinup to combat
+    the autoregressive train-val distribution shift.
+
+    Parameters
+    ----------
+    effective_K : int or None
+        Current push-forward K for this epoch (from progressive
+        curriculum).  If None, uses cfg.pushforward_K.
 
     Returns
     -------
@@ -405,18 +461,40 @@ def _train_one_event_unified(
     n_1d = data["node_1d"].num_nodes
     n_2d = data["node_2d"].num_nodes
 
+    # ── Training Noise Injection (optional, off by default) ──────
+    noise_applied = False
+    orig_dyn_1d = orig_dyn_2d = None
+    if cfg.training_noise_std > 0 and tf_ratio > 0:
+        noise_scale = cfg.training_noise_std * (1.0 - tf_ratio + 0.1)
+        orig_dyn_1d = data["node_1d"].dynamic
+        orig_dyn_2d = data["node_2d"].dynamic
+        data["node_1d"].dynamic = orig_dyn_1d + noise_scale * torch.randn_like(orig_dyn_1d)
+        data["node_2d"].dynamic = orig_dyn_2d + noise_scale * torch.randn_like(orig_dyn_2d)
+        noise_applied = True
+
+    # Resolve effective K (progressive curriculum)
+    K_target = effective_K if effective_K is not None else cfg.pushforward_K
+
     if cfg.use_push_forward:
         # ── Push-Forward Training ─────────────────────────────────
-        # Warm up hidden states with spin-up, then roll out K steps
-        spinup_steps = min(10, T - cfg.pushforward_K)
+        # Randomize spinup length to prevent overfitting to "perfect
+        # 10-step spinup" hidden states.  In validation, errors
+        # contaminate hidden states progressively — this simulates it.
+        if cfg.randomize_spinup:
+            max_spinup = min(cfg.spinup_max, T - K_target)
+            min_spinup = min(cfg.spinup_min, max_spinup)
+            spinup_steps = int(np.random.randint(min_spinup, max(max_spinup + 1, min_spinup + 1)))
+        else:
+            spinup_steps = min(10, T - K_target)
         spinup_steps = max(1, spinup_steps)
 
-        K = min(cfg.pushforward_K, T - spinup_steps)
+        K = min(K_target, T - spinup_steps)
         if K <= 0:
-            K = min(cfg.pushforward_K, T)
+            K = min(K_target, T)
             spinup_steps = 0
 
-        with autocast(device_type=device.type, enabled=cfg.use_amp):
+        # Forward pass under autocast (model inference in fp16)
+        with _amp_context(device.type, cfg.use_amp):
             # Spin-up phase: build hidden state
             h_1d, h_2d = model.init_hidden(n_1d, n_2d, device)
             with torch.no_grad():
@@ -439,29 +517,37 @@ def _train_one_event_unified(
                 )
             )
 
-            # Compute combined loss
-            total_loss, breakdown = criterion.forward_combined(
-                preds_1d, targets_1d,
-                preds_2d, targets_2d,
-                use_push_forward=True,
-            )
+        # CRITICAL: Loss computation in float32 (outside autocast)
+        # fp16 max is ~65504 — inverse-variance weights cause overflow.
+        total_loss, breakdown = criterion.forward_combined(
+            preds_1d.float(), targets_1d.float(),
+            preds_2d.float(), targets_2d.float(),
+            use_push_forward=True,
+        )
     else:
         # ── Full Rollout Training ─────────────────────────────────
-        with autocast(device_type=device.type, enabled=cfg.use_amp):
+        # Forward pass under autocast (model inference in fp16)
+        with _amp_context(device.type, cfg.use_amp):
             preds_1d, preds_2d = model.rollout(
                 data,
                 spinup_steps=min(10, T - 1),
                 teacher_forcing_ratio=tf_ratio,
             )
-            targets_1d = data["node_1d"].y  # [T, N_1d]
-            targets_2d = data["node_2d"].y  # [T, N_2d]
 
-            # Skip spinup steps in loss computation (not scored)
-            skip = min(10, T - 1)
-            total_loss, breakdown = criterion.forward_combined(
-                preds_1d[skip:], targets_1d[skip:],
-                preds_2d[skip:], targets_2d[skip:],
-            )
+        targets_1d = data["node_1d"].y  # [T, N_1d]
+        targets_2d = data["node_2d"].y  # [T, N_2d]
+
+        # CRITICAL: Loss computation in float32 (outside autocast)
+        skip = min(10, T - 1)
+        total_loss, breakdown = criterion.forward_combined(
+            preds_1d[skip:].float(), targets_1d[skip:].float(),
+            preds_2d[skip:].float(), targets_2d[skip:].float(),
+        )
+
+    # ── Restore original dynamic features after noise injection ──
+    if noise_applied:
+        data["node_1d"].dynamic = orig_dyn_1d
+        data["node_2d"].dynamic = orig_dyn_2d
 
     return total_loss, {k: v.item() for k, v in breakdown.items()}
 
@@ -603,7 +689,10 @@ class UnifiedTrainer:
 
         # ── 6. AMP Scaler ────────────────────────────────────────
         if self.cfg.use_amp and self.device.type == "cuda":
-            self.scaler = GradScaler()
+            try:
+                self.scaler = torch.amp.GradScaler("cuda")
+            except TypeError:
+                self.scaler = GradScaler()  # fallback for older PyTorch
         else:
             self.scaler = None
 
@@ -654,20 +743,26 @@ class UnifiedTrainer:
             stds = dataset.compute_node_stds(model_id=mid)
             all_stds[mid] = stds.get(mid, {"1d": np.array([]), "2d": np.array([])})
 
-            # Leave-One-Event-Out split
+            # Leave-One-Event-Out split (supports comma-separated val IDs)
             available_events = model_ds.get_event_ids()
-            val_eid = self.cfg.val_event_id
+            val_eids = [v.strip() for v in self.cfg.val_event_id.split(",")]
 
-            # If the specified val event doesn't exist for this model,
-            # use the last available event as fallback.
-            if val_eid not in available_events:
-                val_eid = available_events[-1]
+            # Filter to val events that actually exist for this model
+            valid_val_eids = [v for v in val_eids if v in available_events]
+            if not valid_val_eids:
+                # Fallback: use last 2 available events
+                valid_val_eids = available_events[-2:] if len(available_events) >= 2 else available_events[-1:]
                 print(
-                    f"  Val event '{self.cfg.val_event_id}' not in "
-                    f"Model_{mid}. Using '{val_eid}' instead."
+                    f"  Val events {val_eids} not in Model_{mid}. "
+                    f"Using {valid_val_eids} instead."
                 )
 
-            train_ds, val_ds = model_ds.split_by_event(val_eid)
+            # Split: val = events matching any valid_val_eid, train = rest
+            val_eid_set = set(valid_val_eids)
+            train_ds = model_ds._shallow_copy()
+            val_ds = model_ds._shallow_copy()
+            train_ds.events = [e for e in model_ds.events if e["event_id"] not in val_eid_set]
+            val_ds.events = [e for e in model_ds.events if e["event_id"] in val_eid_set]
 
             if self.cfg.verbose:
                 print(f"  Model_{mid}: {len(train_ds)} train, {len(val_ds)} val events")
@@ -693,6 +788,13 @@ class UnifiedTrainer:
 
         self.train_graphs = all_train_events
         self.val_graphs = all_val_events
+
+        # ── Per-model static feature z-score normalization ────────
+        # Model_1 has elevations ~293-360m, Model_2 ~23-55m.
+        # Without normalization, the GNN sees wildly different feature
+        # scales between models, hindering cross-model generalization.
+        # Compute per-model mean/std from static features and apply.
+        self._normalize_static_features()
 
         # Aggregate stds across models (use first model's dims as reference)
         # For models with different node counts, we keep model-specific stds
@@ -721,6 +823,68 @@ class UnifiedTrainer:
             self.stds_1d = torch.ones(1)
         if self.stds_2d is None:
             self.stds_2d = torch.ones(1)
+
+    def _normalize_static_features(self) -> None:
+        """Apply per-model z-score normalization to static node features.
+
+        Model_1 (elevations 293-360m) and Model_2 (elevations 23-55m)
+        have very different absolute feature scales.  Without normalization,
+        the shared GNN weights must simultaneously handle both scales,
+        which is suboptimal.
+
+        For each model, we compute mean/std from the static features of
+        the FIRST training graph (all events for a given model share the
+        same static features) and normalize all graphs for that model.
+
+        Features that should NOT be normalized (have physical meaning in
+        the model forward pass): we normalize all static columns but
+        store the raw ``invert_elev``, ``capacity``, and ``baseline``
+        separately (these are not part of ``x`` that gets normalized).
+        """
+        all_graphs = self.train_graphs + self.val_graphs
+        if not all_graphs:
+            return
+
+        # Group graphs by model_id
+        model_groups: Dict[str, List[Any]] = {}
+        for g in all_graphs:
+            mid = g.model_id
+            if mid not in model_groups:
+                model_groups[mid] = []
+            model_groups[mid].append(g)
+
+        for mid, graphs in model_groups.items():
+            ref = graphs[0]  # all share same static features
+
+            # 1D static: z-score normalize
+            x_1d = ref["node_1d"].x  # [N_1d, F]
+            mean_1d = x_1d.mean(dim=0, keepdim=True)
+            std_1d = x_1d.std(dim=0, keepdim=True).clamp(min=1e-6)
+            for g in graphs:
+                g["node_1d"].x = (g["node_1d"].x - mean_1d) / std_1d
+
+            # 2D static: z-score normalize
+            x_2d = ref["node_2d"].x  # [N_2d, F]
+            mean_2d = x_2d.mean(dim=0, keepdim=True)
+            std_2d = x_2d.std(dim=0, keepdim=True).clamp(min=1e-6)
+            for g in graphs:
+                g["node_2d"].x = (g["node_2d"].x - mean_2d) / std_2d
+
+            if self.cfg.verbose:
+                print(
+                    f"  Model_{mid}: static features z-score normalized "
+                    f"(1D: {x_1d.shape[1]} feats, 2D: {x_2d.shape[1]} feats)"
+                )
+
+            # Store stats for inference-time normalization
+            if not hasattr(self, '_static_norm_stats'):
+                self._static_norm_stats: Dict[str, Dict[str, Tensor]] = {}
+            self._static_norm_stats[mid] = {
+                "mean_1d": mean_1d.squeeze(0),
+                "std_1d": std_1d.squeeze(0),
+                "mean_2d": mean_2d.squeeze(0),
+                "std_2d": std_2d.squeeze(0),
+            }
 
     def _build_model(self) -> None:
         """Construct the UnifiedFloodModel from the first training graph."""
@@ -752,6 +916,26 @@ class UnifiedTrainer:
                 self.optimizer,
                 T_max=T_max,
                 eta_min=self.cfg.cosine_eta_min,
+            )
+        elif self.cfg.scheduler == "cosine_warm":
+            self.scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                self.optimizer,
+                T_0=self.cfg.cosine_warm_T0,
+                T_mult=self.cfg.cosine_warm_T_mult,
+                eta_min=self.cfg.cosine_eta_min,
+            )
+        elif self.cfg.scheduler == "onecycle":
+            # OneCycleLR: single cosine cycle with warmup phase.
+            # steps_per_epoch=1 because scheduler.step() is called
+            # once per epoch (not per batch) in our training loop.
+            self.scheduler = optim.lr_scheduler.OneCycleLR(
+                self.optimizer,
+                max_lr=self.cfg.lr,
+                epochs=self.cfg.epochs,
+                steps_per_epoch=1,
+                pct_start=self.cfg.onecycle_pct_start,
+                div_factor=self.cfg.onecycle_div_factor,
+                final_div_factor=1e4,
             )
         elif self.cfg.scheduler == "plateau":
             self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
@@ -813,6 +997,16 @@ class UnifiedTrainer:
             tf_ratio = self.tf_scheduler.get_ratio(epoch)
             current_lr = self.optimizer.param_groups[0]["lr"]
 
+            # Compute effective K for logging
+            if self.cfg.progressive_K and self.cfg.use_push_forward:
+                _prog = min(epoch / max(self.cfg.K_ramp_epochs, 1), 1.0)
+                _eff_K = int(
+                    self.cfg.K_start + _prog * (self.cfg.pushforward_K - self.cfg.K_start)
+                )
+                _eff_K = max(self.cfg.K_start, min(_eff_K, self.cfg.pushforward_K))
+            else:
+                _eff_K = self.cfg.pushforward_K
+
             # ── Train one epoch ───────────────────────────────────
             train_loss, train_breakdown = self._train_epoch(epoch, tf_ratio)
 
@@ -841,7 +1035,7 @@ class UnifiedTrainer:
                 )
                 print(
                     f"Epoch {epoch:>3d}/{self.cfg.epochs} "
-                    f"[{phase:>7s} tf={tf_ratio:.2f}] "
+                    f"[{phase:>7s} tf={tf_ratio:.2f} K={_eff_K:>2d}] "
                     f"| loss={train_loss:.5f} "
                     f"| val_srmse={val_srmse:.5f} "
                     f"| lr={current_lr:.2e} "
@@ -857,6 +1051,7 @@ class UnifiedTrainer:
                         ckpt_dir / "best_model.pt",
                         self.model, self.optimizer, self.scheduler,
                         epoch, self.history, self.cfg,
+                        extra={"static_norm_stats": getattr(self, '_static_norm_stats', {})},
                     )
 
             if (epoch + 1) % self.cfg.save_every_n_epochs == 0:
@@ -864,6 +1059,7 @@ class UnifiedTrainer:
                     ckpt_dir / f"epoch_{epoch:03d}.pt",
                     self.model, self.optimizer, self.scheduler,
                     epoch, self.history, self.cfg,
+                    extra={"static_norm_stats": getattr(self, '_static_norm_stats', {})},
                 )
 
             # ── LR Scheduler Step ─────────────────────────────────
@@ -896,6 +1092,7 @@ class UnifiedTrainer:
         """Train one full epoch over all training events.
 
         Shuffles event order each epoch for stochastic training.
+        Computes progressive K for push-forward curriculum.
 
         Returns
         -------
@@ -905,6 +1102,17 @@ class UnifiedTrainer:
         total_loss = 0.0
         breakdown_accum: Dict[str, float] = {}
         n_events = len(self.train_graphs)
+
+        # ── Progressive K Curriculum ──────────────────────────────
+        # Start with K_start and ramp linearly to pushforward_K.
+        if self.cfg.progressive_K and self.cfg.use_push_forward:
+            progress = min(epoch / max(self.cfg.K_ramp_epochs, 1), 1.0)
+            effective_K = int(
+                self.cfg.K_start + progress * (self.cfg.pushforward_K - self.cfg.K_start)
+            )
+            effective_K = max(self.cfg.K_start, min(effective_K, self.cfg.pushforward_K))
+        else:
+            effective_K = self.cfg.pushforward_K
 
         # Shuffle event order
         event_order = np.random.permutation(n_events)
@@ -936,7 +1144,8 @@ class UnifiedTrainer:
             try:
                 loss, breakdown = _train_one_event_unified(
                     self.model, data, event_criterion, self.cfg,
-                    tf_ratio, self.device, self.scaler
+                    tf_ratio, self.device, self.scaler,
+                    effective_K=effective_K,
                 )
             except RuntimeError as e:
                 if "out of memory" in str(e).lower():
@@ -945,6 +1154,15 @@ class UnifiedTrainer:
                     print(f"  OOM on event {data.event_id} — skipping")
                     continue
                 raise
+
+            # ── NaN guard ─────────────────────────────────────────
+            # If loss is NaN/Inf (numerical instability), skip this
+            # event entirely to prevent poisoning model weights.
+            if not torch.isfinite(loss):
+                self.optimizer.zero_grad()  # discard any partial grads
+                if self.cfg.verbose:
+                    print(f"  NaN/Inf loss on event {data.event_id} — skipping")
+                continue
 
             # Gradient accumulation
             loss_scaled = loss / self.cfg.batch_accumulation

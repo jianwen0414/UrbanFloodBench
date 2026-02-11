@@ -81,6 +81,22 @@ def test_model(model_id: str) -> None:
     assert (hetero["node_1d"].capacity > 0).all(), "Capacity must be positive"
     print("  Physics (capacity > 0): OK")
 
+    # Target normalization: baselines (elevation references) stored
+    assert hasattr(hetero["node_1d"], "baseline"), "Missing 1D baseline"
+    assert hasattr(hetero["node_2d"], "baseline"), "Missing 2D baseline"
+    assert hetero["node_1d"].baseline.shape == (hetero["node_1d"].num_nodes,)
+    assert hetero["node_2d"].baseline.shape == (hetero["node_2d"].num_nodes,)
+    # With depth-based targets, baseline stores elevation references:
+    #   1D: invert_elev,  2D: min_elev
+    # Targets at t=0 are initial water depth (NOT zero like anomalies).
+    # Depth should be non-negative at t=0 for surface nodes.
+    assert hetero["node_2d"].y[0].min() >= -0.01, \
+        f"2D t=0 depth should be ~non-negative, got min={hetero['node_2d'].y[0].min():.4f}"
+    # 1D depth can be >= 0 (pipe at or above invert at start)
+    assert hetero["node_1d"].y[0].min() >= -1.0, \
+        f"1D t=0 depth suspiciously negative, got min={hetero['node_1d'].y[0].min():.4f}"
+    print("  Target normalization (baselines = elevation refs, depth targets): OK")
+
     # Physics: fill_ratio is bounded [0, 5]
     fill_ratio = hetero["node_1d"].dynamic[..., 1]  # second dynamic feature
     assert fill_ratio.min() >= 0.0, f"fill_ratio min={fill_ratio.min()}"

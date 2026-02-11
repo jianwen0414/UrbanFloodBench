@@ -187,6 +187,14 @@ def predict_event(
     1. Spin-up (ground truth) → build GRU hidden states
     2. Prediction (autoregressive) → scored predictions
 
+    The model predicts *depth* (height above a physical reference):
+      - 1D: depth = WSE − invert_elevation
+      - 2D: depth = WSE − min_elevation
+
+    This function adds the elevation reference (stored in
+    ``data[nt].baseline``) back to recover absolute water levels
+    for the submission: ``WSE = depth + elevation_ref``.
+
     Parameters
     ----------
     model : UnifiedFloodModel
@@ -197,8 +205,8 @@ def predict_event(
     Returns
     -------
     (preds_1d, preds_2d)
-        preds_1d : Tensor [T, N_1d]
-        preds_2d : Tensor [T, N_2d]
+        preds_1d : Tensor [T, N_1d]  — absolute water levels
+        preds_2d : Tensor [T, N_2d]  — absolute water levels
     """
     data = data.to(device)
     model.eval()
@@ -211,6 +219,16 @@ def predict_event(
         spinup_steps=skip,
         teacher_forcing_ratio=0.0,
     )
+
+    # ── Denormalize: add elevation reference back ──────────────────
+    # The model predicts depth; the submission needs absolute WSE.
+    # baseline stores: invert_elev (1D) or min_elev (2D).
+    if hasattr(data["node_1d"], "baseline"):
+        baseline_1d = data["node_1d"].baseline.to(device)  # [N_1d]
+        preds_1d = preds_1d + baseline_1d.unsqueeze(0)
+    if hasattr(data["node_2d"], "baseline"):
+        baseline_2d = data["node_2d"].baseline.to(device)  # [N_2d]
+        preds_2d = preds_2d + baseline_2d.unsqueeze(0)
 
     return preds_1d, preds_2d
 
@@ -250,12 +268,16 @@ class SubmissionGenerator:
         device: Union[str, torch.device] = "cpu",
         spinup_steps: int = 10,
         verbose: bool = True,
+        static_norm_stats: Optional[Dict[str, Dict[str, Tensor]]] = None,
     ) -> None:
         self.model = model
         self.data_root = data_root
         self.device = torch.device(device) if isinstance(device, str) else device
         self.spinup_steps = spinup_steps
         self.verbose = verbose
+        # Per-model z-score normalization stats from training.
+        # If None, no normalization is applied (backward compatible).
+        self.static_norm_stats = static_norm_stats or {}
 
         self.model.to(self.device)
         self.model.eval()
@@ -295,6 +317,17 @@ class SubmissionGenerator:
             try:
                 # Build graph
                 data = build_unified_graph(sample)
+
+                # Apply per-model static z-score normalization
+                # (must match what was done during training)
+                if model_id in self.static_norm_stats:
+                    stats = self.static_norm_stats[model_id]
+                    data["node_1d"].x = (
+                        (data["node_1d"].x - stats["mean_1d"]) / stats["std_1d"]
+                    )
+                    data["node_2d"].x = (
+                        (data["node_2d"].x - stats["mean_2d"]) / stats["std_2d"]
+                    )
 
                 # Run inference
                 preds_1d, preds_2d = predict_event(
@@ -479,7 +512,13 @@ class SubmissionGenerator:
         model.to(dev)
         model.eval()
 
-        return cls(model=model, data_root=data_root, device=dev, **kwargs)
+        # Load per-model static normalization stats if available
+        static_norm_stats = ckpt.get("static_norm_stats", {})
+
+        return cls(
+            model=model, data_root=data_root, device=dev,
+            static_norm_stats=static_norm_stats, **kwargs,
+        )
 
 
 # =====================================================================
