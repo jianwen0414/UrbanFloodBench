@@ -597,6 +597,7 @@ def standardized_rmse_metric(
     node_stds: Tensor,
     mask: Optional[Tensor] = None,
     per_node: bool = False,
+    min_std: float = 0.01,
 ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
     """Compute the **exact** Standardized RMSE used on the leaderboard.
 
@@ -622,6 +623,10 @@ def standardized_rmse_metric(
         ``True`` = include, ``False`` = ignore.
     per_node : bool
         If ``True``, also return the per-node SRMSE vector.
+    min_std : float
+        Minimum std threshold.  Nodes with σ below this value are
+        clamped to prevent near-zero-σ nodes (always dry) from
+        dominating the metric with astronomical values.
 
     Returns
     -------
@@ -640,7 +645,9 @@ def standardized_rmse_metric(
         mse_per_node = sq_err.mean(dim=0)  # (N,)
 
     rmse_per_node = mse_per_node.sqrt()                     # (N,)
-    srmse_per_node = rmse_per_node / (node_stds + _EPS)     # (N,)
+    # Clamp node_stds to prevent near-zero-σ nodes from exploding
+    safe_stds = node_stds.clamp(min=min_std)
+    srmse_per_node = rmse_per_node / (safe_stds + _EPS)     # (N,)
     srmse = srmse_per_node.mean()
 
     if per_node:
