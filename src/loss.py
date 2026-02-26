@@ -174,6 +174,7 @@ def standardized_rmse_loss(
     mask: Optional[Tensor] = None,
     clamp_weights: float = 100.0,
     reduction: Literal["mean", "sum", "none"] = "mean",
+    min_std: Optional[float] = None,
 ) -> Tensor:
     """Variance-weighted MSE loss that mirrors the competition SRMSE.
 
@@ -221,10 +222,14 @@ def standardized_rmse_loss(
 
     # 2. Inverse-variance weights from per-node σ
     #    node_stds is (N,) — PyTorch broadcasts across leading dims.
-    weights = 1.0 / (node_stds.pow(2) + _EPS)
-
-    # 3. Clamp to prevent "always dry" nodes from dominating gradients
-    weights = torch.clamp(weights, max=clamp_weights)
+    #    When min_std is set, floor σ first (matches validation metric's
+    #    min_std=0.01).  Otherwise fall back to clamp_weights cap.
+    if min_std is not None:
+        safe_stds = node_stds.clamp(min=min_std)
+        weights = 1.0 / (safe_stds.pow(2) + _EPS)
+    else:
+        weights = 1.0 / (node_stds.pow(2) + _EPS)
+        weights = torch.clamp(weights, max=clamp_weights)
 
     # 4. Weighted squared error
     weighted_sq_err = sq_err * weights  # broadcast (N,) → (..., N)
@@ -310,6 +315,7 @@ def push_forward_loss(
     mask: Optional[Tensor] = None,
     clamp_weights: float = 100.0,
     temporal_scheme: Literal["uniform", "linear", "exponential"] = "linear",
+    min_std: Optional[float] = None,
 ) -> Tensor:
     """Variance-weighted trajectory loss over a K-step rollout.
 
@@ -353,9 +359,82 @@ def push_forward_loss(
         step_losses[k] = standardized_rmse_loss(
             preds[k], targets[k], node_stds,
             mask=step_mask, clamp_weights=clamp_weights,
+            min_std=min_std,
         )
 
     return (tw * step_losses).sum()
+
+
+# =====================================================================
+#  Per-Node SRMSE Loss (direct metric alignment — v7)
+# =====================================================================
+
+def per_node_srmse_loss(
+    preds: Tensor,
+    targets: Tensor,
+    node_stds: Tensor,
+    min_std: float = 0.01,
+    temporal_scheme: Literal["uniform", "linear", "exponential"] = "linear",
+    eps: float = 1e-6,
+) -> Tensor:
+    """Per-node SRMSE loss — directly approximates the competition metric.
+
+    Unlike :func:`push_forward_loss` which averages MSE/σ² (a smooth
+    but **misaligned** surrogate), this function computes the actual
+    SRMSE formula used on the leaderboard:
+
+    .. math::
+
+        \\mathcal{L}
+        = \\frac{1}{N} \\sum_{i=1}^{N}
+          \\frac{\\sqrt{\\sum_k w_k (\\hat{y}_{ki} - y_{ki})^2}}
+               {\\max(\\sigma_i,\\, \\sigma_{\\min})}
+
+    Key differences from ``push_forward_loss``:
+
+    1. The ``sqrt`` is taken **per node** before averaging.  This
+       matters because ``E[\\sqrt{X}] \\neq \\sqrt{E[X]}``
+       (Jensen's inequality).  The metric averages RMSE/σ ratios,
+       so training should too.
+
+    2. Uses ``min_std`` clamp (matching ``standardized_rmse_metric``)
+       instead of ``clamp_weights`` on 1/σ².  This ensures the same
+       nodes that dominate the validation score also dominate the
+       training gradient.
+
+    Parameters
+    ----------
+    preds : Tensor, shape ``(K, N)``
+        Predictions at each step of the K-step rollout.
+    targets : Tensor, shape ``(K, N)``
+        Ground truth at each step.
+    node_stds : Tensor, shape ``(N,)``
+        Per-node standard deviations of the target water level.
+    min_std : float
+        Minimum σ clamp (default 0.01, matching validation metric).
+    temporal_scheme : {"uniform", "linear", "exponential"}
+        Weight scheme over K steps.
+    eps : float
+        Epsilon inside sqrt for numerical stability.
+
+    Returns
+    -------
+    Tensor
+        Scalar SRMSE loss, fully differentiable.
+    """
+    K, N = preds.shape
+    tw = _temporal_weights(
+        K, temporal_scheme, device=preds.device, dtype=preds.dtype
+    )
+
+    sq_err = (preds - targets).pow(2)                          # [K, N]
+    wmse_per_node = (tw.unsqueeze(1) * sq_err).sum(dim=0)      # [N]
+    rmse_per_node = (wmse_per_node + eps).sqrt()                # [N]
+
+    safe_stds = node_stds.clamp(min=min_std)                   # [N]
+    srmse_per_node = rmse_per_node / safe_stds                 # [N]
+
+    return srmse_per_node.mean()
 
 
 # =====================================================================
