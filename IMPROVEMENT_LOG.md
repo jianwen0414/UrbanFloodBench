@@ -157,15 +157,106 @@ return (x - 0.0) / 1.0  # falls back to NO normalization
 
 ---
 
-## Run 8 — V2 Training Loop + V1 Graph Builder *(CURRENT)*
+## Run 8 — V2 Training Loop + V1 Graph Builder
 **Date:** Feb 26, 2025 | **Pipeline:** `train_v2.py` + `graph_builder_unified.py` + `model_v2.py` (SAGEConv)
-**Config:** SAGEConv, const_mask, min_std=0.01, spinup=10, ar_noise=0.005, V1 graph builder with correct normalization, node_degree + is_leaf features
+**Config:** SAGEConv (hidden=128, 4 layers), const_mask, min_std=0.01, spinup=10, ar_noise=0.005, OneCycleLR, K ramp via 2+ep//2, node_degree + is_leaf features (13 1D features)
 
 | Metric | Value |
 |--------|-------|
-| Best Val SRMSE | *Running...* |
+| Best Val SRMSE | **1.88** (epoch 95) |
+| Trajectory | 43→47→29→6.7→2.07→1.88 |
 
-**Expected:** Should converge close to V1's 0.87, with correctly normalized features.
+**What happened:** Correctly normalized features helped (starting val 43 vs 759 in Run 7). But V2's training loop had 5 suboptimal differences vs V1: hidden=128 (vs 256), OneCycleLR (vs warmup+cosine), K ramp 2× faster, fixed spinup (vs randomized), single GRUCell (vs 2-layer GRU).
+
+**Fix:** Abandoned `train_v2.py`. Switched to `train_unified.py` directly.
+
+---
+
+## Run 9 — V1 Full Pipeline (train_unified.py)
+**Date:** Feb 27-28, 2025 | **Pipeline:** `train_unified.py` + `graph_builder_unified.py` + `model_unified.py`
+**Config:** hidden=256, 3 layers, 2-layer GRU, LR warmup+cosine 1e-3, K_max=15, K_ramp=50, tf_min=0.10, randomized spinup [3,10], EMA decay=0.998, node_degree + is_leaf features (13 1D features)
+
+| Metric | Value |
+|--------|-------|
+| Best EMA Val | **0.99** (epoch 26, K=8, TF=0.53) |
+| Best Raw Val | **0.95** (epoch 29, K=9, TF=0.46) |
+| Final (stopped ep 52) | EMA=22.7, Raw=65.2 (collapsed) |
+
+**What happened:** Model achieved excellent per-step accuracy at K=8-9 (raw val 0.95). Then COLLAPSED as K exceeded 8 and TF dropped below 0.5. By epoch 52 (K=15, TF=0.10), EMA had degraded from 0.99 to 22.7.
+
+**Root cause: Training at K>8 is destructive for Model 2.** The model's per-step accuracy at K=8 is good enough for 87-step validation rollouts (proven by raw val=0.95), but forcing it to train at K=12-15 introduces noisy gradients that degrade learned dynamics.
+
+**Additional finding:** `node_degree` + `is_leaf` features (added in Run 7) were unverified additions not present in Run 4 that achieved 0.87. Reverted to 11 1D features.
+
+---
+
+## Run 10 — K_max=8 + Reverted Features
+**Date:** Mar 1-2, 2025 | **Pipeline:** `train_unified.py` + `graph_builder_unified.py` + `model_unified.py`
+**Config:** Same as Run 9 EXCEPT: K_max=8 (was 15), K_ramp=20ep (was 50), tf_min=0.20 (was 0.10), 11 1D features (reverted from 13)
+
+| Metric | Value |
+|--------|-------|
+| Best EMA Val | **1.09** (epoch 24, K=8, TF=0.62) |
+| Best Raw Val | **0.97** (epoch 34, K=8, TF=0.42) |
+| Final (stopped ep 51) | EMA=5.40, degrading |
+
+**What happened:** K capped at 8 prevented the catastrophic Run 9 collapse (EMA 22.7), but the model STILL collapsed as TF decayed below 0.60. EMA peaked at 1.09 (ep 24, TF=0.62), then degraded to 5.40 by ep 51 (TF=0.20).
+
+**Key insight: The fundamental bottleneck is TF decay, not K.** The model cannot maintain performance when teacher forcing drops below ~60%, regardless of rollout length. All runs show the same pattern:
+
+| Run | Best Raw Val | At What TF | What collapsed it |
+|-----|-------------|------------|-------------------|
+| Run 4 | 0.87 | ~0.5-0.6 | K>9 + TF<0.5 |
+| Run 9 | 0.95 | 0.46 | K>8 + TF<0.5 |
+| Run 10 | 0.97 | 0.42 | TF<0.6 alone (K=8 fixed) |
+
+**Conclusion:** Further hyperparameter tuning of K/TF/LR is hitting diminishing returns. The model architecture + training loop has a fundamental ceiling around SRMSE ~0.87-0.97 for Model 2. Need a different approach.
+
+---
+
+## Run 11 — Edge Flow Features (v8)
+**Date:** Mar 2-3, 2025 | **Pipeline:** `train_unified.py` (v8) + `graph_builder_unified.py` + `model_unified.py`
+**Config:** Same as Run 10 EXCEPT: 14 1D features (+3 edge flow), 25 2D features (+3 edge flow), K_max=8, tf_min=0.20
+
+**New features added:**
+- `edge_mean_inflow`: per-node average inflow from connected edges (vectorized `np.add.at`)
+- `edge_mean_outflow`: per-node average outflow from connected edges
+- `edge_net_flow`: inflow - outflow (net water accumulation signal)
+
+| Metric | Value |
+|--------|-------|
+| Best EMA Val | **0.89** (epoch 39, K=8, TF=0.32) |
+| Best Raw Val | **0.89** (epoch 27, K=8, TF=0.56) |
+| Final (stopped ep 91) | EMA=2.13, raw=1.19 |
+
+**Comparison with Run 10 (no edge flow):**
+
+| Metric | Run 10 | Run 11 | Improvement |
+|--------|--------|--------|-------------|
+| Best EMA | 1.09 (ep 24, TF=0.62) | **0.89** (ep 39, TF=0.32) | **18% better** |
+| Best Raw | 0.97 (ep 34, TF=0.42) | **0.89** (ep 27, TF=0.56) | **8% better** |
+| EMA at TF=0.20 | 3.64 (rapid collapse) | ~1.13 (gradual) | Much more stable |
+
+**Key insights:**
+1. **Edge flow features are the most impactful addition since depth-based targets (Run 4).** Raw val 0.89 matches V1's historic best of 0.87.
+2. **TF collapse delayed and milder.** Model held at EMA ≤ 1.0 until TF=0.30 (vs TF=0.60 in Run 10).
+3. **Same fundamental TF collapse persists** — EMA degraded from 0.89 → 2.13 once TF settled at 0.20.
+
+**Expected:** Edge flow features provide explicit water movement physics that the model previously had to learn from depth alone. Should improve AR stability.
+
+**Post-Run 11 — Submission & Data Leakage Finding (Mar 3):**
+- Created `generate_submission.py` to build submission CSVs using EMA checkpoints
+- **CRITICAL BUG FOUND:** Edge flow features (inflow/outflow/net_flow) cause **data leakage** — during training and AR validation, GT edge flows for future timesteps are implicitly available via `graph["1d"].x[t]`. At test inference, flows must be frozen from the last spinup step, making them stale for ~80 remaining timesteps. Val SRMSE 0.89 is inflated; public score was **0.79** (worse than expected).
+- Edge flows should be **removed** until a proper AR-compatible scheme exists (e.g., predicting flows alongside depths).
+
+**2D Pipeline Analysis (Member B, 0.3 public score):**
+The teammate's 2D-only pipeline uses a fundamentally different training strategy:
+- **Combined depth+delta loss:** `MSE(depth) + 0.5*MSE(delta)` — two gradient signals anchor both absolute levels and per-step changes
+- **Per-timestep backprop** vs our multi-step push-forward loss — simpler but may generalize better
+- **Smaller model:** hidden=64, 2 SAGE layers (~100K params vs 6.2M) — less prone to overfitting
+- **BatchNorm** in GNN vs our LayerNorm — different trade-offs
+- **Higher LR:** 5e-3 vs 1e-3 — faster convergence on a simpler task
+- **Key takeaway:** The dual loss (depth + delta) is directly transferable and could help anchor our model's absolute predictions
 
 ---
 
@@ -189,6 +280,9 @@ return (x - 0.0) / 1.0  # falls back to NO normalization
 | Gradient clipping (1.0) | Prevents extreme flood event gradients from destabilizing |
 | AR noise injection (0.005) | Regularizes autoregressive predictions |
 | Delta clamping (1D: ±5, 2D: ±2) | Prevents per-step explosion |
+| K_max ≤ 8 for Model 2 | Run 9: model achieves 0.95 at K=8, collapses at K>8 |
+| tf_min ≥ 0.20 for Model 2 | Too low (0.10) allowed AR error compounding |
+| V1 graph builder z-score normalization | Run 7 (V2 broken norm) → 2.07; Run 8 (V1 norm) → 1.88 |
 
 ### ❌ Proven Harmful / Ineffective
 | Technique | Evidence | Why |
@@ -203,19 +297,38 @@ return (x - 0.0) / 1.0  # falls back to NO normalization
 | Sinusoidal PE (replacing raw positions) | Run 7: unverified, +2 extra features | May or may not help; was combined with broken normalization |
 | Removing const_mask | Run 5: SRMSE >1000 | Dry node drift on 3400+ nodes compounds over K steps |
 | Fixed K=15 from epoch 0 | Run 2: 3.53 | 6× slower, early predictions at steps 10-15 are pure noise |
-| Anomaly targets (WSE-WSE(0)) | Run 3: 300m feature mismatch | AR feedback uses absolute WL, training used anomaly  |
+| K_max=15 for Model 2 | Run 4, Run 9: AR collapse at K>8 | Training at K>8 produces noisy gradients that destroy learned dynamics |
+| Anomaly targets (WSE-WSE(0)) | Run 3: 300m feature mismatch | AR feedback uses absolute WL, training used anomaly |
 | spinup=5 (reduced warm-up) | Run 5: unstable | Half the GRU context → wildly off initial predictions |
 | Weight clamp_max=100 | Run 1: dry nodes dominated gradients | 100× weight means one dry node = 100 wet nodes |
+| node_degree + is_leaf features | Run 9: 0.99 vs Run 4: 0.87 | Unverified features not present in best run; may add noise |
+| OneCycleLR (in train_v2.py) | Run 8: 1.88 vs Run 9: 0.99 | LR warmup + cosine decay is more stable |
+| **Edge flow features (train/test mismatch)** | **Run 11: 0.89 val but 0.79 public** | **GT future flows visible during val but frozen at test — data leakage** |
 
 ### ⚠️ Untested / Open Questions
 | Technique | Status | Notes |
 |-----------|--------|-------|
-| 5-fold cross-validation | Proposed, never implemented | 3 fixed val events may not cover rainfall distribution |
-| Flow/velocity edge features | Proposed in SRMSE_DIAGNOSTIC_REPORT | `dynamic_*_edges` has flow/velocity data — unused |
+| **Combined depth+delta dual loss** | From 2D pipeline analysis | `MSE(depth) + 0.5*MSE(delta)` — two gradient signals |
+| **tf_min = 0.50** | Strongly implied by all runs | Best results at TF=0.42-0.56; floor prevents collapse |
+| **Early stopping (patience=15)** | Implied by all runs | All degraded after best EMA; saves 60-80% compute |
+| 5-fold cross-validation | Implemented (`--fold`), not yet run | Would stabilize the noisy 3-event val metric |
+| Edge velocity features | Available but unused | Same leakage problem as flow — unusable without AR prediction |
 | Roughness fallback from 1D pipes | Proposed | Model 2 has zero 2D roughness; could interpolate from 1D |
-| log(1+area) for scale invariance | Tried in V2 graph builder but WITH broken normalization | Need to test with correct stats computation |
-| Curriculum by event length | Proposed | Train on shorter events first (T≤100), then fine-tune |
-| Higher LR (0.002-0.003) | Proposed in audit | Member B uses 0.005; hasn't been tried in unified pipeline |
-| Non-zero TF min_ratio for Model 2 | Proposed (0.10-0.15) | Would inject some GT during full AR phase |
-| Degree-aware loss weighting | Proposed | Higher weight on degree-2 nodes to force accuracy |
-| Node degree + is_leaf features | ✅ Added in Run 7 | Needs evaluation with correct normalization (Run 8) |
+| Higher LR (0.002-0.005) | Member B uses 0.005 | Unified pipeline uses 1e-3; may converge faster |
+| Ensemble (multi-checkpoint average) | Now viable | Average predictions from multiple epochs or folds |
+
+---
+
+## What's Next (Priority Order)
+
+### 🥇 P0: Run 12 — Anti-Collapse + Dual Loss (no edge flows)
+1. **Remove edge flow features** — fix the data leakage (revert to 11 1D / 22 2D features)
+2. **tf_min = 0.50** — prevent the TF collapse that plagues every run
+3. **Combined depth+delta loss** — add auxiliary MSE on absolute depth (inspired by 2D pipeline)
+4. **Early stopping (patience=15)** — stop wasting compute after peak
+
+### 🥈 P1: 5-Fold CV
+If Run 12 shows improvement, run full 5-fold CV for robust measurement and ensemble.
+
+### 🥉 P2: Ensemble
+Average predictions from 5-fold models or multi-checkpoint snapshots. Free improvement.
