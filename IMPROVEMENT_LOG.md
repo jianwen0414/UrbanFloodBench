@@ -237,6 +237,9 @@ return (x - 0.0) / 1.0  # falls back to NO normalization
 | Best Raw | 0.97 (ep 34, TF=0.42) | **0.89** (ep 27, TF=0.56) | **8% better** |
 | EMA at TF=0.20 | 3.64 (rapid collapse) | ~1.13 (gradual) | Much more stable |
 
+Complete entry of best epoch:
+  Epoch  39/120 | loss=0.0693 (1d=0.0202 2d=0.1184) | val=6.2248 ema=0.8883 | K=8 TF=0.32 LR=8.0e-04 | 650.6s *
+
 **Key insights:**
 1. **Edge flow features are the most impactful addition since depth-based targets (Run 4).** Raw val 0.89 matches V1's historic best of 0.87.
 2. **TF collapse delayed and milder.** Model held at EMA ≤ 1.0 until TF=0.30 (vs TF=0.60 in Run 10).
@@ -257,6 +260,50 @@ The teammate's 2D-only pipeline uses a fundamentally different training strategy
 - **BatchNorm** in GNN vs our LayerNorm — different trade-offs
 - **Higher LR:** 5e-3 vs 1e-3 — faster convergence on a simpler task
 - **Key takeaway:** The dual loss (depth + delta) is directly transferable and could help anchor our model's absolute predictions
+
+---
+
+## Run 12 — Anti-Collapse + Dual Loss (v9, no edge flows)
+**Date:** Mar 3-5, 2025 | **Pipeline:** `train_unified.py` (v9) + `graph_builder_unified.py` + `model_unified.py`
+**Config:** 11 1D features, 22 2D features (edge flows removed), K_max=8, tf_min=0.50, loss=SRMSE+0.1×depth_MSE, early_stop=15
+
+**Changes from Run 11:**
+1. ❌ Removed edge flow features (data leakage fix — GT flows visible during val but frozen at test)
+2. 🔼 tf_min raised from 0.20 → 0.50 (anti-collapse)
+3. ✨ Combined depth+delta dual loss: `SRMSE + 0.1 × MSE(depth)` (from 2D pipeline analysis)
+4. ⏹️ Early stopping with patience=15
+
+| Metric | Value |
+|--------|-------|
+| Best EMA Val | **1.03** (epoch 31, K=8, TF=0.68) |
+| Best Raw Val | **1.18** (epoch 36, K=8, TF=0.61) |
+| Early stopped | epoch 46 (TF=0.50, EMA=12.88) |
+
+**Comparison with Run 10 (same feature set, no dual loss, tf_min=0.20):**
+
+| Metric | Run 10 | Run 12 | Delta |
+|--------|--------|--------|-------|
+| Best EMA | 1.09 (ep 24, TF=0.62) | **1.03** (ep 31, TF=0.68) | **6% better** |
+| Best Raw | 0.97 (ep 34, TF=0.42) | 1.18 (ep 36, TF=0.61) | 22% worse |
+| Compute (epochs) | 120 (ran to end) | **46** (early stopped) | **62% saved** |
+
+**Key insights:**
+1. **Dual loss provided modest improvement** — EMA 1.03 vs 1.09 (6% better than Run 10 with same features). The auxiliary MSE on absolute depth helps anchor predictions.
+2. **TF collapse STILL occurs around TF=0.55-0.60** — even with tf_min=0.50 as floor. The collapse happens BEFORE TF reaches the floor. Best at TF=0.68, degraded rapidly below TF=0.55.
+3. **Early stopping worked perfectly** — saved 74 epochs of wasted compute. Model peaked at epoch 31, early stopped at epoch 46.
+4. **The tf_min=0.50 floor was irrelevant** — collapse happened at TF≈0.55, well above the floor. The model can't sustain accuracy below ~55% teacher forcing regardless of the floor setting.
+5. **Raw val was worse than Run 10** — 1.18 vs 0.97. The dual loss may interfere with the raw model's flexibility (EMA smoothing compensates).
+
+Complete training log (key epochs):
+```
+Epoch  0  | loss=1.1076 | val=119.99 ema=109.11 | K=2 TF=1.00 *
+Epoch  8  | loss=0.0216 | val=1.36   ema=45.75  | K=4 TF=0.96 *
+Epoch 15  | loss=0.0228 | val=1.23   ema=1.90   | K=6 TF=0.88 *
+Epoch 24  | loss=0.1018 | val=1.61   ema=1.18   | K=8 TF=0.76 *
+Epoch 31  | loss=0.0364 | val=37.17  ema=1.03   | K=8 TF=0.68 * ← BEST
+Epoch 40  | loss=0.0328 | val=10.55  ema=1.35   | K=8 TF=0.56
+Epoch 46  | loss=0.0240 | val=62.53  ema=12.88  | K=8 TF=0.50 ← EARLY STOP
+```
 
 ---
 
@@ -283,6 +330,8 @@ The teammate's 2D-only pipeline uses a fundamentally different training strategy
 | K_max ≤ 8 for Model 2 | Run 9: model achieves 0.95 at K=8, collapses at K>8 |
 | tf_min ≥ 0.20 for Model 2 | Too low (0.10) allowed AR error compounding |
 | V1 graph builder z-score normalization | Run 7 (V2 broken norm) → 2.07; Run 8 (V1 norm) → 1.88 |
+| **Early stopping (patience=15)** | **Run 12: saved 74 epochs (62% compute), no quality loss** |
+| **Combined depth+delta dual loss (0.1×MSE)** | **Run 12: EMA 1.03 vs Run 10: 1.09 (6% improvement)** |
 
 ### ❌ Proven Harmful / Ineffective
 | Technique | Evidence | Why |
@@ -304,31 +353,32 @@ The teammate's 2D-only pipeline uses a fundamentally different training strategy
 | node_degree + is_leaf features | Run 9: 0.99 vs Run 4: 0.87 | Unverified features not present in best run; may add noise |
 | OneCycleLR (in train_v2.py) | Run 8: 1.88 vs Run 9: 0.99 | LR warmup + cosine decay is more stable |
 | **Edge flow features (train/test mismatch)** | **Run 11: 0.89 val but 0.79 public** | **GT future flows visible during val but frozen at test — data leakage** |
+| **tf_min=0.50 as anti-collapse** | **Run 12: collapse at TF=0.55, before floor reached** | **TF collapse happens above the floor — floor is irrelevant** |
 
 ### ⚠️ Untested / Open Questions
 | Technique | Status | Notes |
 |-----------|--------|-------|
-| **Combined depth+delta dual loss** | From 2D pipeline analysis | `MSE(depth) + 0.5*MSE(delta)` — two gradient signals |
-| **tf_min = 0.50** | Strongly implied by all runs | Best results at TF=0.42-0.56; floor prevents collapse |
-| **Early stopping (patience=15)** | Implied by all runs | All degraded after best EMA; saves 60-80% compute |
 | 5-fold cross-validation | Implemented (`--fold`), not yet run | Would stabilize the noisy 3-event val metric |
-| Edge velocity features | Available but unused | Same leakage problem as flow — unusable without AR prediction |
-| Roughness fallback from 1D pipes | Proposed | Model 2 has zero 2D roughness; could interpolate from 1D |
 | Higher LR (0.002-0.005) | Member B uses 0.005 | Unified pipeline uses 1e-3; may converge faster |
 | Ensemble (multi-checkpoint average) | Now viable | Average predictions from multiple epochs or folds |
+| Smaller model (hidden=64-128) | Member B: hidden=64, 2 layers | Fewer params → less overfitting to TF regime |
+| Per-timestep backprop (no push-forward) | Member B uses single-step loss | May train faster and avoid K-step error accumulation |
+| Curriculum on TF floor instead of TF decay | New idea from Run 12 | Instead of decaying TF, keep TF=1.0 and slowly reduce K? |
+| BatchNorm (replacing LayerNorm) | Member B uses BatchNorm | Different normalisation dynamics during AR rollout |
 
 ---
 
 ## What's Next (Priority Order)
 
-### 🥇 P0: Run 12 — Anti-Collapse + Dual Loss (no edge flows)
-1. **Remove edge flow features** — fix the data leakage (revert to 11 1D / 22 2D features)
-2. **tf_min = 0.50** — prevent the TF collapse that plagues every run
-3. **Combined depth+delta loss** — add auxiliary MSE on absolute depth (inspired by 2D pipeline)
-4. **Early stopping (patience=15)** — stop wasting compute after peak
+### 🥇 P0: Fundamentally Rethink the TF Collapse
+The TF collapse at ~0.55 is the fundamental bottleneck. Every technique so far (edge flows, dual loss, higher tf_min) only slightly delays it. **The model cannot learn to feed its own predictions back.** Potential approaches:
+1. **Smaller model** — hidden=64-128, 2 GNN layers (Member B's recipe, fewer params to overfit)
+2. **Higher LR** — 0.003-0.005 (Member B uses 0.005, may traverse loss landscape faster)
+3. **Per-timestep backprop** — drop push-forward loss entirely, train per-step like Member B
+4. **Longer spinup** — give GRU more context before scoring begins
 
-### 🥈 P1: 5-Fold CV
-If Run 12 shows improvement, run full 5-fold CV for robust measurement and ensemble.
+### 🥈 P1: Generate Submission with Current Best
+Use best EMA Model 1 + best EMA Model 2 (both v9) to generate a submission and benchmark.
 
-### 🥉 P2: Ensemble
-Average predictions from 5-fold models or multi-checkpoint snapshots. Free improvement.
+### 🥉 P2: 5-Fold CV + Ensemble
+If any approach beats 1.03, run 5-fold CV and ensemble for the final push.

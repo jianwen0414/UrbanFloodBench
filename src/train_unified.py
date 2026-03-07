@@ -183,13 +183,7 @@ def compute_model_stats(
     rain_acc: List[np.ndarray] = []
     rain_rolling_acc: List[np.ndarray] = []
     rain_delta_acc: List[np.ndarray] = []
-    # Edge flow accumulators (per-node aggregated flow from edges)
-    edge_inflow_1d_acc: List[np.ndarray] = []
-    edge_outflow_1d_acc: List[np.ndarray] = []
-    edge_netflow_1d_acc: List[np.ndarray] = []
-    edge_inflow_2d_acc: List[np.ndarray] = []
-    edge_outflow_2d_acc: List[np.ndarray] = []
-    edge_netflow_2d_acc: List[np.ndarray] = []
+    # Edge flow accumulators REMOVED (Run 12: data leakage fix)
 
     # Per-node 1D depth accumulators (for per-node normalization)
     n_1d = len(s1d)
@@ -263,60 +257,7 @@ def compute_model_stats(
             rain_rolling_acc.append(rolling.ravel())
             rain_delta_acc.append(delta.ravel())
 
-        # Edge flow aggregation (simple: just use raw flow values for stats)
-        dyn_1d_edges = sample.get("dynamic_1d_edges", pd.DataFrame())
-        dyn_2d_edges = sample.get("dynamic_2d_edges", pd.DataFrame())
-        ei_1d = sample_0["edge_index_1d"]
-        ei_2d = sample_0["edge_index_2d"]
-
-        def _agg_flow_for_stats(edge_dyn, edge_idx_df, n_nodes):
-            """Vectorized aggregation: per-node mean absolute flow."""
-            if edge_dyn.empty or edge_idx_df.empty:
-                return np.zeros(0), np.zeros(0), np.zeros(0)
-            src = edge_idx_df["from_node"].values
-            dst = edge_idx_df["to_node"].values
-            eidxs = edge_dyn["edge_idx"].values.astype(np.int64)
-            flows = edge_dyn["flow"].values.astype(np.float64)
-            # Filter valid
-            valid = eidxs < len(src)
-            eidxs = eidxs[valid]
-            flows = flows[valid]
-            abs_flow = np.abs(flows)
-            s = src[eidxs]
-            d = dst[eidxs]
-            fwd = flows >= 0
-            rev = ~fwd
-            inflow = np.zeros(n_nodes, dtype=np.float64)
-            outflow = np.zeros(n_nodes, dtype=np.float64)
-            cnt_in = np.zeros(n_nodes, dtype=np.float64)
-            cnt_out = np.zeros(n_nodes, dtype=np.float64)
-            if fwd.any():
-                np.add.at(outflow, s[fwd], abs_flow[fwd])
-                np.add.at(cnt_out, s[fwd], 1)
-                np.add.at(inflow, d[fwd], abs_flow[fwd])
-                np.add.at(cnt_in, d[fwd], 1)
-            if rev.any():
-                np.add.at(outflow, d[rev], abs_flow[rev])
-                np.add.at(cnt_out, d[rev], 1)
-                np.add.at(inflow, s[rev], abs_flow[rev])
-                np.add.at(cnt_in, s[rev], 1)
-            cnt_in = np.maximum(cnt_in, 1)
-            cnt_out = np.maximum(cnt_out, 1)
-            inflow /= cnt_in
-            outflow /= cnt_out
-            net = inflow - outflow
-            return inflow, outflow, net
-
-        inf1, outf1, netf1 = _agg_flow_for_stats(dyn_1d_edges, ei_1d, n_1d)
-        if len(inf1) > 0:
-            edge_inflow_1d_acc.append(inf1)
-            edge_outflow_1d_acc.append(outf1)
-            edge_netflow_1d_acc.append(netf1)
-        inf2, outf2, netf2 = _agg_flow_for_stats(dyn_2d_edges, ei_2d, n_2d)
-        if len(inf2) > 0:
-            edge_inflow_2d_acc.append(inf2)
-            edge_outflow_2d_acc.append(outf2)
-            edge_netflow_2d_acc.append(netf2)
+        # Edge flow stats REMOVED (Run 12: data leakage fix)
 
     def _stats(
         arrays: List[np.ndarray],
@@ -402,10 +343,6 @@ def compute_model_stats(
             "pipe_length": _static_stats(pipe_len.astype(np.float64)),
             "pipe_roughness": _static_stats(pipe_rough.astype(np.float64)),
             "pipe_slope": _static_stats(pipe_slope.astype(np.float64)),
-            # Dynamic edge flow (per-node aggregated)
-            "edge_mean_inflow": _stats(edge_inflow_1d_acc) if edge_inflow_1d_acc else {"mean": 0.0, "std": 1.0},
-            "edge_mean_outflow": _stats(edge_outflow_1d_acc) if edge_outflow_1d_acc else {"mean": 0.0, "std": 1.0},
-            "edge_net_flow": _stats(edge_netflow_1d_acc) if edge_netflow_1d_acc else {"mean": 0.0, "std": 1.0},
         },
         "2d": {
             "depth": _stats(depth_2d_acc),
@@ -430,10 +367,6 @@ def compute_model_stats(
             ) if effective_depth_acc else {"mean": 0.0, "std": 1.0},
             "position_x": _static_stats(pos_x_vals),
             "position_y": _static_stats(pos_y_vals),
-            # Dynamic edge flow (per-node aggregated)
-            "edge_mean_inflow": _stats(edge_inflow_2d_acc) if edge_inflow_2d_acc else {"mean": 0.0, "std": 1.0},
-            "edge_mean_outflow": _stats(edge_outflow_2d_acc) if edge_outflow_2d_acc else {"mean": 0.0, "std": 1.0},
-            "edge_net_flow": _stats(edge_netflow_2d_acc) if edge_netflow_2d_acc else {"mean": 0.0, "std": 1.0},
         },
     }
 
@@ -781,12 +714,21 @@ def _train_one_event(
 
     # Equal 1D/2D balance (matches competition formula)
     srmse_loss = 0.5 * loss_1d + 0.5 * loss_2d
-    total_loss = srmse_loss
+
+    # ── Run 12: Combined depth+delta dual loss (from 2D pipeline) ──
+    #    Auxiliary MSE on absolute WSE anchors predictions to correct
+    #    depth levels, not just correct deltas.  Weight 0.1 to avoid
+    #    overwhelming the primary SRMSE signal.
+    import torch.nn.functional as F
+    depth_mse_1d = F.mse_loss(preds_1d.float(), targets_1d.float())
+    depth_mse_2d = F.mse_loss(preds_2d.float(), targets_2d.float())
+    depth_mse = 0.5 * depth_mse_1d + 0.5 * depth_mse_2d
+    total_loss = srmse_loss + 0.1 * depth_mse
 
     breakdown = {
         "loss_1d": loss_1d.item(),
         "loss_2d": loss_2d.item(),
-        "phys": 0.0,
+        "phys": depth_mse.item(),  # reuse 'phys' key for depth MSE
         "total": total_loss.item(),
     }
     return total_loss, breakdown
@@ -970,7 +912,7 @@ def train_model(
     K_ramp_epochs: int = 40,
     tf_warmup_epochs: int = 5,
     tf_decay_epochs: int = 40,
-    tf_min_ratio: float = 0.0,
+    tf_min_ratio: float = 0.50,  # Run 12: high floor prevents TF collapse
     clamp_weights: float = 20.0,
     delta_clamp: float = 2.0,
     delta_clamp_1d: float = 5.0,
@@ -1004,7 +946,7 @@ def train_model(
         "2": {
             "pushforward_K": 8,
             "K_ramp_epochs": 20,
-            "tf_min_ratio": 0.20,
+            "tf_min_ratio": 0.50,  # Run 12: anti-collapse (was 0.20)
         },
     }
     overrides = MODEL_OVERRIDES.get(model_id, {})
@@ -1120,6 +1062,7 @@ def train_model(
     best_epoch = 0
     best_val_raw = float("inf")  # best raw val (for dual checkpoint)
     best_epoch_raw = 0
+    early_stop_patience = 15  # Run 12: stop after 15 epochs without EMA improvement
 
     os.makedirs(checkpoint_dir, exist_ok=True)
 
@@ -1294,6 +1237,14 @@ def train_model(
                 f"{elapsed:.1f}s{star}"
             )
 
+        # ── Early stopping (Run 12) ────────────────────────────────
+        if epoch - best_epoch >= early_stop_patience and epoch > 20:
+            if verbose:
+                print(f"\n  Early stopping: no EMA improvement for "
+                      f"{early_stop_patience} epochs (best={best_val:.4f} "
+                      f"at ep {best_epoch})")
+            break
+
     print(f"\n  Best EMA val SRMSE: {best_val:.6f} (epoch {best_epoch})")
     print(f"  Best raw val SRMSE: {best_val_raw:.6f} (epoch {best_epoch_raw})")
     history["best_val"] = best_val  # type: ignore[assignment]
@@ -1365,7 +1316,7 @@ def main() -> None:
         del _ds_tmp
 
     print("=" * 60)
-    print("  UNIFIED HETERO-MODEL TRAINING (v8 — Edge Features)")
+    print("  UNIFIED HETERO-MODEL TRAINING (v9 — Anti-Collapse + Dual Loss)")
     print("=" * 60)
     print(f"  Models         : {model_ids}")
     print(f"  Epochs         : {args.epochs}")
@@ -1374,7 +1325,7 @@ def main() -> None:
     print(f"  AR noise std   : {args.ar_noise_std}")
     print(f"  Delta max 2D   : ±{args.delta_clamp} ft/step")
     print(f"  Delta max 1D   : ±{args.delta_clamp_1d} ft/step")
-    print(f"  Loss           : push_forward (min_std=0.01)")
+    print(f"  Loss           : push_forward + 0.1*depth_MSE (dual loss)")
     print(f"  1D depth norm  : per-node")
     print(f"  Val events     : {val_event_ids}")
     print(f"  Checkpoint dir : {args.checkpoint_dir}")

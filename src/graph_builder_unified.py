@@ -73,7 +73,6 @@ _1D_FEATURE_NAMES: List[str] = [
     "depth", "inlet_flow", "lag1", "lag2", "lag3",
     "capacity", "base_area",
     "pipe_diameter", "pipe_length", "pipe_roughness", "pipe_slope",  # Phase B
-    "edge_mean_inflow", "edge_mean_outflow", "edge_net_flow",  # Dynamic edge features
 ]
 _2D_FEATURE_NAMES: List[str] = [
     "depth", "rainfall", "lag1", "lag2", "lag3",
@@ -83,7 +82,6 @@ _2D_FEATURE_NAMES: List[str] = [
     "curvature", "flow_accumulation", "elev_rel_neighbors", "dist_to_drain",
     "is_connected",
     "position_x", "position_y",  # Phase A: Member B alignment
-    "edge_mean_inflow", "edge_mean_outflow", "edge_net_flow",  # Dynamic edge features
 ]
 
 # Dynamic feature indices replaced during AR rollout in training loop
@@ -93,9 +91,6 @@ EFFECTIVE_DEPTH_IDX: int = 5  # Alias for WATER_VOL_IDX (same slot)
 LAG1_IDX: int = 2
 LAG2_IDX: int = 3
 LAG3_IDX: int = 4
-# Edge flow feature indices (for AR replacement with lagged values)
-EDGE_INFLOW_1D_IDX: int = 11  # index in 1D feature vector
-EDGE_INFLOW_2D_IDX: int = 22  # index in 2D feature vector
 
 
 # =====================================================================
@@ -631,100 +626,10 @@ def build_hetero_graph(
     norm_pipe_slope = _pipe_norm(pipe_slope_np, "pipe_slope").unsqueeze(0).expand(T, -1)
 
     # ------------------------------------------------------------------
-    # 6b. Dynamic edge flow → per-node aggregation (NEW)
+    # 6b. Edge flow features REMOVED (Run 12: data leakage fix)
+    #      GT edge flows were visible during training/val but frozen at
+    #      test inference → train/test distribution mismatch.
     # ------------------------------------------------------------------
-    dyn_1d_edges: pd.DataFrame = raw_data.get("dynamic_1d_edges", pd.DataFrame())
-    dyn_2d_edges: pd.DataFrame = raw_data.get("dynamic_2d_edges", pd.DataFrame())
-
-    def _aggregate_edge_flow_to_nodes(
-        edge_dyn_df: pd.DataFrame,
-        edge_index_df: pd.DataFrame,
-        n_nodes: int,
-        T: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Aggregate per-edge flow to per-node features (vectorized).
-
-        Returns [T, N] tensors: (mean_inflow, mean_outflow, net_flow).
-        """
-        mean_inflow = torch.zeros(T, n_nodes)
-        mean_outflow = torch.zeros(T, n_nodes)
-
-        if edge_dyn_df.empty or edge_index_df.empty:
-            return mean_inflow, mean_outflow, mean_inflow  # all zeros
-
-        # Build edge_idx → (src, dst) mapping from edge_index_df
-        src_nodes = edge_index_df["from_node"].values  # [E_static]
-        dst_nodes = edge_index_df["to_node"].values     # [E_static]
-
-        # Vectorized: extract arrays from DataFrame
-        ts = edge_dyn_df["timestep"].values.astype(np.int64)
-        eidxs = edge_dyn_df["edge_idx"].values.astype(np.int64)
-        flows = edge_dyn_df["flow"].values.astype(np.float32)
-
-        # Filter valid edges and timesteps
-        valid = (ts < T) & (eidxs < len(src_nodes))
-        ts = ts[valid]
-        eidxs = eidxs[valid]
-        flows = flows[valid]
-
-        src = src_nodes[eidxs]  # source node for each edge record
-        dst = dst_nodes[eidxs]  # destination node for each edge record
-        abs_flow = np.abs(flows)
-
-        # Forward flow (flow >= 0): src→dst; Reverse flow (flow < 0): dst→src
-        fwd = flows >= 0
-        rev = ~fwd
-
-        # Accumulate into [T, N] arrays using np.add.at
-        sum_inflow = np.zeros((T, n_nodes), dtype=np.float32)
-        sum_outflow = np.zeros((T, n_nodes), dtype=np.float32)
-        cnt_in = np.zeros((T, n_nodes), dtype=np.float32)
-        cnt_out = np.zeros((T, n_nodes), dtype=np.float32)
-
-        # Forward flow: outflow at src, inflow at dst
-        if fwd.any():
-            np.add.at(sum_outflow, (ts[fwd], src[fwd]), abs_flow[fwd])
-            np.add.at(cnt_out, (ts[fwd], src[fwd]), 1)
-            np.add.at(sum_inflow, (ts[fwd], dst[fwd]), abs_flow[fwd])
-            np.add.at(cnt_in, (ts[fwd], dst[fwd]), 1)
-
-        # Reverse flow: outflow at dst, inflow at src
-        if rev.any():
-            np.add.at(sum_outflow, (ts[rev], dst[rev]), abs_flow[rev])
-            np.add.at(cnt_out, (ts[rev], dst[rev]), 1)
-            np.add.at(sum_inflow, (ts[rev], src[rev]), abs_flow[rev])
-            np.add.at(cnt_in, (ts[rev], src[rev]), 1)
-
-        # Average
-        cnt_in = np.maximum(cnt_in, 1)
-        cnt_out = np.maximum(cnt_out, 1)
-        mean_inflow = torch.from_numpy(sum_inflow / cnt_in)
-        mean_outflow = torch.from_numpy(sum_outflow / cnt_out)
-        net_flow = mean_inflow - mean_outflow
-
-        return mean_inflow, mean_outflow, net_flow
-
-    inflow_1d, outflow_1d, netflow_1d = _aggregate_edge_flow_to_nodes(
-        dyn_1d_edges, ei_1d_df, n_1d, T
-    )
-    inflow_2d, outflow_2d, netflow_2d = _aggregate_edge_flow_to_nodes(
-        dyn_2d_edges, ei_2d_df, n_2d, T
-    )
-
-    # Normalize edge flow features
-    s1_ef = s1.get("edge_mean_inflow", {"mean": 0.0, "std": 1.0})
-    norm_inflow_1d = _normalize(inflow_1d, s1_ef["mean"], s1_ef["std"])
-    s1_of = s1.get("edge_mean_outflow", {"mean": 0.0, "std": 1.0})
-    norm_outflow_1d = _normalize(outflow_1d, s1_of["mean"], s1_of["std"])
-    s1_nf = s1.get("edge_net_flow", {"mean": 0.0, "std": 1.0})
-    norm_netflow_1d = _normalize(netflow_1d, s1_nf["mean"], s1_nf["std"])
-
-    s2_ef = s2.get("edge_mean_inflow", {"mean": 0.0, "std": 1.0})
-    norm_inflow_2d = _normalize(inflow_2d, s2_ef["mean"], s2_ef["std"])
-    s2_of = s2.get("edge_mean_outflow", {"mean": 0.0, "std": 1.0})
-    norm_outflow_2d = _normalize(outflow_2d, s2_of["mean"], s2_of["std"])
-    s2_nf = s2.get("edge_net_flow", {"mean": 0.0, "std": 1.0})
-    norm_netflow_2d = _normalize(netflow_2d, s2_nf["mean"], s2_nf["std"])
 
     # 2D dynamic
     norm_depth_2d = _normalize(depth_2d, s2["depth"]["mean"], s2["depth"]["std"])
@@ -789,12 +694,9 @@ def build_hetero_graph(
             norm_pipe_len,                                    # 8: pipe_length
             norm_pipe_rough,                                  # 9: pipe_roughness
             norm_pipe_slope,                                  # 10: pipe_slope
-            norm_inflow_1d,                                   # 11: edge_mean_inflow
-            norm_outflow_1d,                                  # 12: edge_mean_outflow
-            norm_netflow_1d,                                  # 13: edge_net_flow
         ],
         dim=-1,
-    )  # [T, N_1d, 14]
+    )  # [T, N_1d, 11]
 
     x_2d = torch.stack(
         [
@@ -820,12 +722,9 @@ def build_hetero_graph(
             is_connected.unsqueeze(0).expand(T, -1),          # 19: is_connected
             norm_pos_x.unsqueeze(0).expand(T, -1),            # 20: position_x (Phase A)
             norm_pos_y.unsqueeze(0).expand(T, -1),             # 21: position_y
-            norm_inflow_2d,                                   # 22: edge_mean_inflow
-            norm_outflow_2d,                                  # 23: edge_mean_outflow
-            norm_netflow_2d,                                  # 24: edge_net_flow
         ],
         dim=-1,
-    )  # [T, N_2d, 25]
+    )  # [T, N_2d, 22]
 
     # ------------------------------------------------------------------
     # 9.  Assemble HeteroData

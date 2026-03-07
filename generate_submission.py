@@ -104,8 +104,8 @@ def predict_event_v7(
     prev_depth_1d = graph["1d"].depth[spinup - 1].to(device)
     prev_depth_2d = graph["2d"].depth[spinup - 1].to(device)
 
-    # Cache last known edge flows from the end of the spinup period
-    # To prevent NaNs when model expects true future edge flows
+    # v9+ models: no edge flow features (removed due to data leakage)
+    # Legacy v8 compat: if checkpoint has >11/22 features, freeze last 3 from spinup
     has_edge_flows_1d = graph["1d"].x.size(-1) > 11
     has_edge_flows_2d = graph["2d"].x.size(-1) > 22
     if has_edge_flows_1d:
