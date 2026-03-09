@@ -22,8 +22,10 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
+import pandas as pd
 import torch
 
 from src.config import RAW_DATA_PATH
@@ -57,6 +59,8 @@ def train_both_models(
     early_stopping_patience: int = 12,
     checkpoint_dir: str = "checkpoints",
     force_retrain: bool = False,
+    conv_type: Literal["sage", "gat"] = "sage",
+    num_heads: int = 4,
 ) -> dict:
     """Train separate models for Model_1 and Model_2.
 
@@ -112,7 +116,7 @@ def train_both_models(
         print("=" * 70)
 
         checkpoint_path = (
-            Path(checkpoint_dir) / f"model_{model_id}_best.pt"
+            Path(checkpoint_dir) / f"model_{model_id}_{conv_type}.pt"
         )
 
         # ── skip if already trained ───────────────────────────────
@@ -128,6 +132,8 @@ def train_both_models(
                 num_sage_layers=num_sage_layers,
                 dropout=0.1,
                 max_delta=2.0,
+                conv_type=conv_type,
+                num_heads=num_heads,
             )
             load_checkpoint(model, str(checkpoint_path))
             models[model_id] = model
@@ -142,6 +148,8 @@ def train_both_models(
             num_sage_layers=num_sage_layers,
             dropout=0.1,
             max_delta=2.0,
+            conv_type=conv_type,
+            num_heads=num_heads,
         )
         total_params = sum(p.numel() for p in model.parameters())
         print(f"  Parameters: {total_params:,}")
@@ -177,6 +185,13 @@ def train_both_models(
             f"at epoch {history['best_epoch']}"
         )
 
+        # train_model saves to model_{id}_best.pt; copy to conv_type path
+        best_path = Path(checkpoint_dir) / f"model_{model_id}_best.pt"
+        if best_path.exists():
+            import shutil
+            shutil.copy(best_path, checkpoint_path)
+            print(f"  Checkpoint saved: {checkpoint_path}")
+
         # Ensure the model holds the best weights
         load_checkpoint(model, str(checkpoint_path))
 
@@ -188,6 +203,7 @@ def train_both_models(
         "norm_stats_dict": norm_stats_dict,
         "histories": histories,
         "in_channels": in_channels,
+        "conv_type": conv_type,
     }
 
 
@@ -264,7 +280,7 @@ def generate_submission_both_models(
     norm_stats_dict: dict[str, dict],
     data_path: str,
     output_path: str = "submissions/submission_2d.csv",
-) -> "pd.DataFrame":  # noqa: F821 (forward ref — pandas imported at call site)
+) -> pd.DataFrame:
     """Generate a test submission using the correct model per area.
 
     Parameters
@@ -321,6 +337,7 @@ def main() -> None:
 
     models = result["models"]
     norm_stats_dict = result["norm_stats_dict"]
+    conv_type = result.get("conv_type", "sage")
 
     # === STEP 2: Evaluate both models =============================
     evaluate_both_models(
@@ -343,9 +360,10 @@ def main() -> None:
     print("PIPELINE COMPLETE")
     print("=" * 70)
 
+    conv_type = result.get("conv_type", "sage")
     print("\nCheckpoints saved:")
     for mid in ["1", "2"]:
-        cp = Path(f"checkpoints/model_{mid}_best.pt")
+        cp = Path(f"checkpoints/model_{mid}_{conv_type}.pt")
         if cp.exists():
             print(f"  {cp} ({cp.stat().st_size / 1024:.1f} KB)")
         else:
@@ -356,7 +374,8 @@ def main() -> None:
     if sub_path.exists():
         size_mb = sub_path.stat().st_size / (1024 * 1024)
         print(f"  {sub_path} ({size_mb:.2f} MB)")
-        print(f"  Total rows: {len(submission):,}")
+        if submission is not None:
+            print(f"  Total rows: {len(submission):,}")
 
     print("\n" + "-" * 70)
     print("NEXT STEPS:")

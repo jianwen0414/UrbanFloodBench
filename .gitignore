@@ -47,8 +47,6 @@ logs/
 wandb/
 submissions/
 checkpoints/
-submissions/submission_full_dummy.csv
-submissions/submission_2d.csv
-submissions/submission_full_dummy.csv
+
 submissions/submission_2d.csv
 submissions/submission_full_dummy.csv

@@ -71,7 +71,7 @@ def _build_submission_rows(
         Predicted water levels.
     model_id, event_id : str
     node_type : str
-        ``"1d"`` or ``"2d"``.
+        ``"1d"`` or ``"2d"`` (converted to integer 1 or 2 in CSV).
     spinup_steps : int
         Number of initial timesteps to skip (not scored).
 
@@ -82,6 +82,9 @@ def _build_submission_rows(
     """
     T, N = preds.shape
     preds_np = preds.cpu().numpy()
+
+    # Convert node_type string to integer (Kaggle format: 1 or 2)
+    node_type_int = 1 if node_type.lower() == "1d" else 2
 
     rows: List[Dict[str, Any]] = []
 
@@ -101,7 +104,7 @@ def _build_submission_rows(
                 "row_id": row_id,
                 "model_id": int(model_id),
                 "event_id": int(event_id),
-                "node_type": node_type,
+                "node_type": node_type_int,  # Integer 1 or 2
                 "node_id": n,
                 "water_level": water_level,
             })
@@ -128,6 +131,9 @@ def _build_submission_rows_vectorized(
     """
     T, N = preds.shape
     preds_np = preds.cpu().numpy()
+
+    # Convert node_type string to integer (Kaggle format: 1 or 2)
+    node_type_int = 1 if node_type.lower() == "1d" else 2
 
     # Only scored timesteps
     scored_preds = preds_np[spinup_steps:]  # [T_scored, N]
@@ -164,7 +170,7 @@ def _build_submission_rows_vectorized(
         "row_id": row_ids,
         "model_id": mid_int,
         "event_id": eid_int,
-        "node_type": node_type,
+        "node_type": node_type_int,  # Integer 1 or 2
         "node_id": n_flat.astype(int),
         "water_level": wl_flat.astype(np.float64),
     })
