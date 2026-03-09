@@ -481,6 +481,7 @@ def _train_one_event(
     delta_clamp_1d: float = 5.0,
     phys_weight: float = 0.1,
     ar_noise_std: float = 0.005,
+    dry_period: int = 10,  # Run 13: skip early dry timesteps from loss
 ) -> Tuple[Tensor, Dict[str, float]]:
     """Train on a single event with push-forward delta-prediction loss.
 
@@ -493,8 +494,10 @@ def _train_one_event(
     Critical design note
     --------------------
     depth = WSE - elevation can be **naturally negative** for dry cells
-    (93% of 2D, 60% of 1D).  An earlier `.clamp(min=0)` created a
-    30-47 ft bias that pinned loss at ~892.  Removed.
+    (93% of 2D, 60% of 1D).  Run 13 adds `.clamp(min=0.0)` for 2D ONLY.
+    1D depth must NOT be clamped — 60% of 1D nodes have legitimately
+    negative depth (WSE below invert reference), clamping creates
+    a ~180 loss bias that prevents 1D learning entirely.
 
     Returns
     -------
@@ -656,19 +659,24 @@ def _train_one_event(
             * const_mask_2d
         )
 
-        # ── WSE-space prediction (no depth clamping!) ─────────────
+        # ── WSE-space prediction ───────────────────────────────────
+        # Run 13: Physics floor for 2D only — depth cannot go below 0.
+        # 1D depth is NOT clamped: 60% of 1D nodes have naturally negative
+        # depth (WSE below invert ref), clamping creates ~180 loss bias.
         pred_depth_1d = prev_depth_1d + raw_delta_1d
-        # EDA: 2D depth 99% non-negative → physics clamp (Member B alignment)
         pred_depth_2d = (prev_depth_2d + raw_delta_2d).clamp(min=0.0)
 
         # Recover WSE for loss computation
         pred_wse_1d = pred_depth_1d + graph["1d"].elev.to(device)
         pred_wse_2d = pred_depth_2d + graph["2d"].elev.to(device)
 
-        all_pred_wse_1d.append(pred_wse_1d)
-        all_pred_wse_2d.append(pred_wse_2d)
-        all_target_wse_1d.append(graph["1d"].y[t].to(device))
-        all_target_wse_2d.append(graph["2d"].y[t].to(device))
+        # Run 13: skip dry timesteps from loss (GRU still processes them)
+        effective_dry = min(dry_period, max(0, K - 1))
+        if k >= effective_dry:
+            all_pred_wse_1d.append(pred_wse_1d)
+            all_pred_wse_2d.append(pred_wse_2d)
+            all_target_wse_1d.append(graph["1d"].y[t].to(device))
+            all_target_wse_2d.append(graph["2d"].y[t].to(device))
 
         # Update prev_depth + history for next step
         _hist_1d.append(prev_depth_1d)
@@ -854,6 +862,7 @@ def _validate_one_event(
             * const_mask_2d
         )
 
+        # Run 13: Physics floor for 2D only (1D naturally negative)
         pred_depth_1d = prev_depth_1d + raw_delta_1d
         pred_depth_2d = (prev_depth_2d + raw_delta_2d).clamp(min=0.0)
 
@@ -1316,7 +1325,7 @@ def main() -> None:
         del _ds_tmp
 
     print("=" * 60)
-    print("  UNIFIED HETERO-MODEL TRAINING (v9 — Anti-Collapse + Dual Loss)")
+    print("  UNIFIED HETERO-MODEL TRAINING (v10 — Physics Clamping + Dry Skip)")
     print("=" * 60)
     print(f"  Models         : {model_ids}")
     print(f"  Epochs         : {args.epochs}")

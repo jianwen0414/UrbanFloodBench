@@ -163,8 +163,9 @@ def predict_event_v7(
         raw_delta_1d = delta_dict["1d"].clamp(-delta_clamp_1d, delta_clamp_1d) * const_mask_1d
         raw_delta_2d = delta_dict["2d"].clamp(-delta_clamp, delta_clamp) * const_mask_2d
 
+        # Run 13: Physics floor for 2D only (1D naturally negative)
         pred_depth_1d = prev_depth_1d + raw_delta_1d
-        pred_depth_2d = prev_depth_2d + raw_delta_2d
+        pred_depth_2d = (prev_depth_2d + raw_delta_2d).clamp(min=0.0)
 
         # WSE = depth + elevation reference
         pred_wse_1d = pred_depth_1d + graph["1d"].elev.to(device)
