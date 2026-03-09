@@ -1033,7 +1033,13 @@ def train_model(
                         config=training_config,
                     )
             else:
-                epochs_without_improvement += validate_every
+                # Only count towards early stopping AFTER TF warmup.
+                # During warmup (TF=1.0), autoregressive val RMSE is
+                # expected to worsen because the model hasn't learned
+                # to self-correct yet.  Counting those epochs would
+                # kill training exactly when TF decay begins to help.
+                if epoch >= warmup_epochs:
+                    epochs_without_improvement += validate_every
 
             # ── early stopping ────────────────────────────────
             if epochs_without_improvement >= early_stopping_patience:

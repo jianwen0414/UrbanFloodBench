@@ -96,7 +96,10 @@ MODEL_2_SAGE_FALLBACK = {
 # Which model(s) to train: "1", "2", or "both"
 TRAIN_MODEL_ID = "2"
 
-CONFIGS = {"1": MODEL_1_CONFIG, "2": MODEL_2_SAGE_FALLBACK}
+# Default configs: Model_1 = GAT, Model_2 = GAT (2 heads).
+# If Model_2 GAT still misbehaves, temporarily swap to
+# MODEL_2_SAGE_FALLBACK here to fall back to the proven SAGE config.
+CONFIGS = {"1": MODEL_1_CONFIG, "2": MODEL_2_CONFIG}
 
 
 # =====================================================================
