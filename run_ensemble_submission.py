@@ -16,7 +16,7 @@ from src.model_2d import SurfaceEngine, load_checkpoint, predict_event_2d
 from src.utils_2d import compute_normalization_stats
 
 # ── Mode: "sage", "gat", or "blend" ──────────────────────────────────
-MODE = "blend"
+MODE = "sage"
 
 # Blend weights (GAT validated ~16% lower SRMSE on Model_1)
 GAT_WEIGHT = 0.6

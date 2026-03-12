@@ -31,22 +31,22 @@ from src.submission_2d import generate_test_submission_2d
 #  Per-model configs
 # =====================================================================
 
-# Model_1: GAT won the SAGE vs GAT comparison (SRMSE 0.019 vs 0.023).
-# Architecture: 128 hidden, 3 layers — same as the Feb 14 improved run.
+# Model_1: SAGE 128h/3L — same architecture as Feb 14 (0.3089 leaderboard).
+# Lower LR + longer training for better convergence.
 MODEL_1_CONFIG = {
     "hidden_channels": 128,
     "num_sage_layers": 3,
     "dropout": 0.15,
     "max_delta": 2.0,
-    "conv_type": "gat",
+    "conv_type": "sage",
     "num_heads": 4,
 
-    "num_epochs": 50,
-    "lr": 0.002,
+    "num_epochs": 80,
+    "lr": 0.0005,
     "warmup_epochs": 12,
     "decay_epochs": 28,
     "max_timesteps_per_event": 60,
-    "early_stopping_patience": 15,
+    "early_stopping_patience": 25,
     "grad_clip": 1.0,
 }
 
@@ -74,8 +74,8 @@ MODEL_2_CONFIG = {
     "grad_clip": 1.0,
 }
 
-# Fallback: proven-working SAGE config (identical to exp1_lower_lr).
-# Use this if GAT still diverges after the dropout + num_heads fixes.
+# Model_2 SAGE: same architecture as exp1_lower_lr (64h/2L).
+# Lower LR + longer training for better convergence.
 MODEL_2_SAGE_FALLBACK = {
     "hidden_channels": 64,
     "num_sage_layers": 2,
@@ -84,22 +84,21 @@ MODEL_2_SAGE_FALLBACK = {
     "conv_type": "sage",
     "num_heads": 4,
 
-    "num_epochs": 40,
-    "lr": 0.001,
+    "num_epochs": 80,
+    "lr": 0.0005,
     "warmup_epochs": 15,
     "decay_epochs": 20,
     "max_timesteps_per_event": 50,
-    "early_stopping_patience": 15,
+    "early_stopping_patience": 25,
     "grad_clip": 1.0,
 }
 
 # Which model(s) to train: "1", "2", or "both"
-TRAIN_MODEL_ID = "2"
+TRAIN_MODEL_ID = "both"
 
-# Default configs: Model_1 = GAT, Model_2 = GAT (2 heads).
-# If Model_2 GAT still misbehaves, temporarily swap to
-# MODEL_2_SAGE_FALLBACK here to fall back to the proven SAGE config.
-CONFIGS = {"1": MODEL_1_CONFIG, "2": MODEL_2_CONFIG}
+# Both models use SAGE — same 16 features as the 0.3089 baseline.
+# Only changes: lr=0.0005, num_epochs=80, early_stopping_patience=25.
+CONFIGS = {"1": MODEL_1_CONFIG, "2": MODEL_2_SAGE_FALLBACK}
 
 
 # =====================================================================
