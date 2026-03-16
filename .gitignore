@@ -45,6 +45,14 @@ desktop.ini
 runs/
 logs/
 wandb/
+<<<<<<< HEAD
 
 # ── CSV Files ────────────────────────────────────────────────────────
 *.csv
+=======
+submissions/
+checkpoints/
+
+submissions/submission_2d.csv
+submissions/submission_full_dummy.csv
+>>>>>>> feat/2d-pipeline

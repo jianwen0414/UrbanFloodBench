@@ -635,4 +635,8 @@ if __name__ == "__main__":
     )
     print(f"\n  Built graph via DepthHistory: x shape = {data_hist.x.shape}")
 
+<<<<<<< HEAD
     print("\n✓ Inference mode support added successfully!")
+=======
+    print("\n✓ Inference mode support added successfully!")
+>>>>>>> feat/2d-pipeline

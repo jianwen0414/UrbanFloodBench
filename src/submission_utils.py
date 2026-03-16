@@ -201,6 +201,13 @@ def combine_1d_2d_submissions(
     df_1d = pd.read_csv(submission_1d_path)
     df_2d = pd.read_csv(submission_2d_path)
 
+<<<<<<< HEAD
+=======
+    # Coerce node_type to integer (1 or 2 only) in case CSV had floats
+    df_1d["node_type"] = df_1d["node_type"].astype(int)
+    df_2d["node_type"] = df_2d["node_type"].astype(int)
+
+>>>>>>> feat/2d-pipeline
     print(f"1D submission: {len(df_1d):,} rows")
     print(f"2D submission: {len(df_2d):,} rows")
 
@@ -225,6 +232,16 @@ def combine_1d_2d_submissions(
 
     combined.insert(0, "row_id", range(len(combined)))
 
+<<<<<<< HEAD
+=======
+    # Ensure node_type is integer 1 or 2 only (Kaggle format)
+    combined["node_type"] = combined["node_type"].astype(int)
+    if set(combined["node_type"].unique()) != {1, 2}:
+        raise ValueError(
+            f"node_type must be only 1 and 2, got {sorted(combined['node_type'].unique())}"
+        )
+
+>>>>>>> feat/2d-pipeline
     combined = combined[
         [
             "row_id",
@@ -290,4 +307,8 @@ if __name__ == "__main__":
             "  For real submission, get actual 1D predictions "
             "from your team."
         )
+<<<<<<< HEAD
         print("=" * 60)
+=======
+        print("=" * 60)
+>>>>>>> feat/2d-pipeline

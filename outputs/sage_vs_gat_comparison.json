@@ -1,0 +1,43 @@
+{
+  "model_id": "1",
+  "num_events": 5,
+  "num_warmup": 10,
+  "global_std_2d": 14.365270614624023,
+  "parameter_count_sage": 178177,
+  "parameter_count_gat": 144129,
+  "per_event": [
+    {
+      "event_id": 1,
+      "srmse_sage": 0.025050136250373264,
+      "srmse_gat": 0.01990198110572089,
+      "winner": "GAT"
+    },
+    {
+      "event_id": 10,
+      "srmse_sage": 0.024167479249592946,
+      "srmse_gat": 0.01401777121847208,
+      "winner": "GAT"
+    },
+    {
+      "event_id": 11,
+      "srmse_sage": 0.022657989456072655,
+      "srmse_gat": 0.02203864185327859,
+      "winner": "GAT"
+    },
+    {
+      "event_id": 12,
+      "srmse_sage": 0.022516445095086143,
+      "srmse_gat": 0.021646567686896396,
+      "winner": "GAT"
+    },
+    {
+      "event_id": 13,
+      "srmse_sage": 0.01958738321941903,
+      "srmse_gat": 0.018359129521867974,
+      "winner": "GAT"
+    }
+  ],
+  "mean_srmse_sage": 0.02279588665410881,
+  "mean_srmse_gat": 0.019192818277247187,
+  "overall_winner": "GAT"
+}

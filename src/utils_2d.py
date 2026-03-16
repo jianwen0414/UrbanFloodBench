@@ -307,4 +307,8 @@ if __name__ == "__main__":
     roundtrip_error = np.abs(wl - wl_back).max()
     print(f"  Roundtrip error: {roundtrip_error:.10f} (should be ~0)")
 
+<<<<<<< HEAD
     print("\n✓ utils_2d.py complete!")
+=======
+    print("\n✓ utils_2d.py complete!")
+>>>>>>> feat/2d-pipeline

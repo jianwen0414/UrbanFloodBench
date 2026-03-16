@@ -17,6 +17,10 @@ See: IMPLEMENTATION_PLAN.md → Task 3
 
 from __future__ import annotations
 
+<<<<<<< HEAD
+=======
+import csv
+>>>>>>> feat/2d-pipeline
 from pathlib import Path
 from typing import Any, Dict, Union
 
@@ -32,7 +36,12 @@ def generate_test_submission_2d(
     output_path: str = "submissions/submission_2d.csv",
     num_warmup: int = 10,
     verbose: bool = True,
+<<<<<<< HEAD
 ) -> pd.DataFrame:
+=======
+    stream: bool = True,
+) -> pd.DataFrame | None:
+>>>>>>> feat/2d-pipeline
     """Generate 2D predictions for **test** events in competition format.
 
     Parameters
@@ -50,11 +59,22 @@ def generate_test_submission_2d(
         Ground-truth warm-up timesteps (default ``10``).
     verbose : bool
         Print progress.
+<<<<<<< HEAD
 
     Returns
     -------
     pd.DataFrame
         Competition-ready 2D submission.
+=======
+    stream : bool
+        If True (default), write rows incrementally to CSV to avoid OOM.
+        Returns None. If False, accumulate in memory (can cause OOM / exit 137).
+
+    Returns
+    -------
+    pd.DataFrame or None
+        If stream=False, submission DataFrame; if stream=True, None.
+>>>>>>> feat/2d-pipeline
     """
     from src.dataset import FloodDataset
     from src.model_2d import predict_event_2d
@@ -66,6 +86,7 @@ def generate_test_submission_2d(
         print("Generating TEST Submission (2D Nodes Only)")
         print("=" * 60)
         print(f"Warmup timesteps: {num_warmup} (given, not predicted)")
+<<<<<<< HEAD
 
     all_rows: list[dict] = []
 
@@ -188,6 +209,101 @@ def generate_test_submission_2d(
         print(submission_df.head().to_string(index=False))
 
     return submission_df
+=======
+        if stream:
+            print("Streaming to CSV (low memory)")
+
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    total_rows = 0
+    model_row_counts: Dict[int, int] = {}
+    wl_min = float("inf")
+    wl_max = float("-inf")
+
+    with open(output_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            ["row_id", "model_id", "event_id", "node_type", "node_id", "water_level"]
+        )
+        row_id = 0
+
+        for model_id in ["1", "2"]:
+            if isinstance(model, dict):
+                current_model = model.get(model_id)
+                if current_model is None:
+                    if verbose:
+                        print(f"\n  No model for Model_{model_id}, skipping...")
+                    continue
+            else:
+                current_model = model
+
+            norm_stats = norm_stats_dict.get(model_id)
+            if norm_stats is None:
+                if verbose:
+                    print(f"\n  No norm_stats for Model_{model_id}, skipping...")
+                continue
+
+            ds_model = ds_test.filter_by_model(model_id)
+            num_events = len(ds_model)
+            model_row_counts[int(model_id)] = 0
+
+            if verbose:
+                print(f"\nModel_{model_id}: {num_events} test events")
+
+            for event_idx in range(num_events):
+                sample = ds_model[event_idx]
+                event_id = sample["event_id"]
+                num_nodes = len(sample["static_2d_nodes"])
+
+                if verbose:
+                    print(f"  Event_{event_id}: ", end="", flush=True)
+
+                pred_wl, _ = predict_event_2d(
+                    current_model, sample, norm_stats, num_warmup=num_warmup
+                )
+
+                num_timesteps = pred_wl.shape[0]
+                num_predict = num_timesteps - num_warmup
+
+                if verbose:
+                    print(
+                        f"{num_nodes} nodes x {num_predict} timesteps "
+                        f"= {num_nodes * num_predict:,} rows"
+                    )
+
+                mid_int = int(model_id)
+                for node_id in range(num_nodes):
+                    for t in range(num_warmup, num_timesteps):
+                        wl = float(pred_wl[t, node_id].item())
+                        wl_min = min(wl_min, wl)
+                        wl_max = max(wl_max, wl)
+                        writer.writerow(
+                            [row_id, mid_int, int(event_id), int(2), node_id, wl]  # node_type = 2 (integer only)
+                        )
+                        row_id += 1
+
+                model_row_counts[mid_int] += num_nodes * num_predict
+                total_rows += num_nodes * num_predict
+
+    if total_rows == 0:
+        if verbose:
+            print("  No predictions generated!")
+        return None if stream else pd.DataFrame()
+
+    if verbose:
+        print(f"\n{'='*60}")
+        print("2D Submission Summary:")
+        print(f"  Total rows: {total_rows:,}")
+        for mid in sorted(model_row_counts.keys()):
+            print(f"  Model_{mid}: {model_row_counts[mid]:,} rows")
+        print(f"  Water level range: [{wl_min:.2f}, {wl_max:.2f}]")
+        size_mb = Path(output_path).stat().st_size / (1024 * 1024)
+        print(f"\nSaved: {output_path}")
+        print(f"Size: {size_mb:.2f} MB")
+
+    if stream:
+        return None
+    return pd.read_csv(output_path)
+>>>>>>> feat/2d-pipeline
 
 
 # ───────────────────────────────────────────────────────────────────────
@@ -228,6 +344,10 @@ if __name__ == "__main__":
         num_sage_layers=2,
         dropout=0.0,
         max_delta=2.0,
+<<<<<<< HEAD
+=======
+        conv_type="sage",
+>>>>>>> feat/2d-pipeline
     )
 
     # Try to load a trained checkpoint
@@ -254,4 +374,8 @@ if __name__ == "__main__":
         print(f"\n  Error: {exc}")
         import traceback
 
+<<<<<<< HEAD
         traceback.print_exc()
+=======
+        traceback.print_exc()
+>>>>>>> feat/2d-pipeline

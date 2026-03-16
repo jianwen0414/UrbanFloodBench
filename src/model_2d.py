@@ -1,9 +1,17 @@
 """
+<<<<<<< HEAD
 model_2d — SurfaceEngine: GraphSAGE-GRU for 2D surface water depth.
 
 Predicts **delta depth** (change in water depth) at each timestep on
 the 2D surface mesh.  The architecture fuses spatial message-passing
 (GraphSAGE) with temporal dynamics (GRU) and enforces two physical
+=======
+model_2d — SurfaceEngine: GraphSAGE- or GAT-GRU for 2D surface water depth.
+
+Predicts **delta depth** (change in water depth) at each timestep on
+the 2D surface mesh.  The architecture fuses spatial message-passing
+(GraphSAGE or GAT) with temporal dynamics (GRU) and enforces two physical
+>>>>>>> feat/2d-pipeline
 constraints:
 
     1. ``|delta| <= max_delta`` — prevents prediction explosions.
@@ -18,7 +26,11 @@ Architecture
 
     Input  x  [N, in_channels]
          │
+<<<<<<< HEAD
     GraphSAGE layers  (spatial neighbour aggregation)
+=======
+    GraphSAGE or GAT layers  (spatial neighbour aggregation)
+>>>>>>> feat/2d-pipeline
          │
     GRU cell          (per-node temporal hidden state)
          │
@@ -32,16 +44,28 @@ from __future__ import annotations
 
 import random
 import time
+<<<<<<< HEAD
+=======
+from typing import Literal
+>>>>>>> feat/2d-pipeline
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+<<<<<<< HEAD
 from torch_geometric.nn import SAGEConv
 
 
 class SurfaceEngine(nn.Module):
     """2D Surface Water Level Predictor (GraphSAGE + GRU).
+=======
+from torch_geometric.nn import GATConv, SAGEConv
+
+
+class SurfaceEngine(nn.Module):
+    """2D Surface Water Level Predictor (GraphSAGE or GAT + GRU).
+>>>>>>> feat/2d-pipeline
 
     Parameters
     ----------
@@ -49,6 +73,7 @@ class SurfaceEngine(nn.Module):
         Number of input features per node (e.g. 16 for 12 static + 4
         dynamic).
     hidden_channels : int
+<<<<<<< HEAD
         Dimension of hidden representations (e.g. 64).
     num_sage_layers : int, optional
         Number of stacked GraphSAGE convolution layers (default ``2``).
@@ -56,6 +81,22 @@ class SurfaceEngine(nn.Module):
         Dropout probability applied after each SAGE layer (default ``0.1``).
     max_delta : float, optional
         Maximum absolute depth change per timestep (default ``1.0`` m).
+=======
+        Dimension of hidden representations (e.g. 64). When
+        ``conv_type="gat"``, must be divisible by ``num_heads`` (e.g. 4).
+    num_sage_layers : int, optional
+        Number of stacked graph convolution layers (default ``2``).
+    dropout : float, optional
+        Dropout probability applied after each conv layer (default ``0.1``).
+    max_delta : float, optional
+        Maximum absolute depth change per timestep (default ``1.0`` m).
+    conv_type : str, optional
+        ``"sage"`` (GraphSAGE) or ``"gat"`` (Graph Attention). Default ``"sage"``.
+    num_heads : int, optional
+        Number of attention heads when ``conv_type="gat"`` (default ``4``).
+        Ignored when ``conv_type="sage"``. Output size is ``hidden_channels``
+        so ``hidden_channels`` must be divisible by ``num_heads``.
+>>>>>>> feat/2d-pipeline
     """
 
     def __init__(
@@ -65,18 +106,67 @@ class SurfaceEngine(nn.Module):
         num_sage_layers: int = 2,
         dropout: float = 0.1,
         max_delta: float = 1.0,
+<<<<<<< HEAD
+=======
+        conv_type: Literal["sage", "gat"] = "sage",
+        num_heads: int = 4,
+>>>>>>> feat/2d-pipeline
     ) -> None:
         super().__init__()
 
         self.hidden_channels = hidden_channels
         self.max_delta = max_delta
         self.dropout = dropout
+<<<<<<< HEAD
 
         # ── GraphSAGE layers (spatial message passing) ───────────────
         self.convs = nn.ModuleList()
         self.convs.append(SAGEConv(in_channels, hidden_channels))
         for _ in range(num_sage_layers - 1):
             self.convs.append(SAGEConv(hidden_channels, hidden_channels))
+=======
+        self.conv_type = conv_type
+        self.num_heads = num_heads
+
+        if conv_type == "gat" and hidden_channels % num_heads != 0:
+            raise ValueError(
+                f"hidden_channels ({hidden_channels}) must be divisible by "
+                f"num_heads ({num_heads}) when conv_type='gat'"
+            )
+
+        # ── Graph conv layers (SAGE or GAT) ─────────────────────────────
+        self.convs = nn.ModuleList()
+        if conv_type == "sage":
+            self.convs.append(SAGEConv(in_channels, hidden_channels))
+            for _ in range(num_sage_layers - 1):
+                self.convs.append(SAGEConv(hidden_channels, hidden_channels))
+        else:  # gat
+            out_per_head = hidden_channels // num_heads
+            # NOTE: GATConv dropout is attention-coefficient dropout.
+            # We already apply F.dropout after each layer in forward(),
+            # so setting both causes double-dropout and inflates the
+            # train/eval distribution gap — deadly for autoregressive
+            # rollout.  Keep GATConv dropout=0; use post-layer dropout only.
+            self.convs.append(
+                GATConv(
+                    in_channels,
+                    out_per_head,
+                    heads=num_heads,
+                    concat=True,
+                    dropout=0.0,
+                )
+            )
+            for _ in range(num_sage_layers - 1):
+                self.convs.append(
+                    GATConv(
+                        hidden_channels,
+                        out_per_head,
+                        heads=num_heads,
+                        concat=True,
+                        dropout=0.0,
+                    )
+                )
+>>>>>>> feat/2d-pipeline
 
         # Batch normalization per layer
         self.bns = nn.ModuleList(
@@ -127,7 +217,11 @@ class SurfaceEngine(nn.Module):
         if hidden is None:
             hidden = self.init_hidden(num_nodes, device=x.device)
 
+<<<<<<< HEAD
         # GraphSAGE layers
+=======
+        # Graph conv layers (SAGE or GAT)
+>>>>>>> feat/2d-pipeline
         h = x
         for conv, bn in zip(self.convs, self.bns):
             h = conv(h, edge_index)
@@ -506,6 +600,7 @@ def save_checkpoint(
     epoch: int,
     loss: float,
     path: str,
+<<<<<<< HEAD
 ) -> None:
     """Save a model checkpoint to *path*.
 
@@ -525,6 +620,32 @@ def save_checkpoint(
         },
         path,
     )
+=======
+    config: dict | None = None,
+) -> None:
+    """Save a model checkpoint to *path*.
+
+    The checkpoint stores model weights, optimiser state, epoch, and loss.
+    If *config* is provided, also stores config, val_rmse, and timestamp
+    so training settings are never lost.
+    """
+    from datetime import datetime
+    from pathlib import Path as _Path
+
+    _Path(path).parent.mkdir(parents=True, exist_ok=True)
+    state = {
+        "model_state_dict": model.state_dict(),
+        "epoch": epoch,
+        "loss": loss,
+        "optimizer_state_dict": optimizer.state_dict(),
+    }
+    if config is not None:
+        state["config"] = config
+        state["val_rmse"] = loss
+        state["timestamp"] = datetime.now().isoformat()
+
+    torch.save(state, path)
+>>>>>>> feat/2d-pipeline
     print(f"  Checkpoint saved: {path}")
 
 
@@ -535,7 +656,14 @@ def load_checkpoint(
 ) -> dict:
     """Load a model checkpoint from *path*.
 
+<<<<<<< HEAD
     If *optimizer* is provided its state is restored too.
+=======
+    If *optimizer* is provided and the checkpoint contains optimizer state,
+    it is restored too. Supports both legacy checkpoints (epoch, loss,
+    model_state_dict, optimizer_state_dict) and new format (+ config,
+    val_rmse, timestamp).
+>>>>>>> feat/2d-pipeline
 
     Returns
     -------
@@ -545,6 +673,7 @@ def load_checkpoint(
     checkpoint = torch.load(path, weights_only=False)
     model.load_state_dict(checkpoint["model_state_dict"])
 
+<<<<<<< HEAD
     if optimizer is not None:
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
 
@@ -552,6 +681,18 @@ def load_checkpoint(
         f"  Loaded checkpoint from epoch {checkpoint['epoch']} "
         f"(loss: {checkpoint['loss']:.6f})"
     )
+=======
+    if optimizer is not None and "optimizer_state_dict" in checkpoint:
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+
+    loss_val = checkpoint.get("val_rmse", checkpoint.get("loss"))
+    print(
+        f"  Loaded checkpoint from epoch {checkpoint['epoch']} "
+        f"(val_rmse/loss: {loss_val:.6f})"
+    )
+    if "config" in checkpoint:
+        print(f"  Config saved in checkpoint (timestamp: {checkpoint.get('timestamp', 'n/a')})")
+>>>>>>> feat/2d-pipeline
     return checkpoint
 
 
@@ -563,6 +704,7 @@ def get_teacher_forcing_ratio(
     epoch: int,
     warmup_epochs: int = 10,
     decay_epochs: int = 30,
+<<<<<<< HEAD
 ) -> float:
     """Compute teacher-forcing ratio for the current epoch.
 
@@ -571,21 +713,57 @@ def get_teacher_forcing_ratio(
     * ``epoch < warmup_epochs``  →  1.0 (always use ground truth)
     * linear decay over ``decay_epochs``  →  1.0 → 0.0
     * ``epoch >= warmup_epochs + decay_epochs``  →  0.0 (always predict)
+=======
+    num_epochs: int | None = None,
+    tf_min_ratio: float | None = None,
+) -> float:
+    """Compute teacher-forcing ratio for the current epoch.
+
+    Two modes:
+
+    1. Legacy (num_epochs and tf_min_ratio not used):
+       * ``epoch < warmup_epochs``  →  1.0 (always use ground truth)
+       * linear decay over ``decay_epochs``  →  1.0 → 0.0
+       * ``epoch >= warmup_epochs + decay_epochs``  →  0.0 (always predict)
+
+    2. Linear over all epochs (when num_epochs and tf_min_ratio are set):
+       * Linear decay from 1.0 to tf_min_ratio over epochs 0 .. num_epochs-1.
+>>>>>>> feat/2d-pipeline
 
     Parameters
     ----------
     epoch : int
         Current epoch.
     warmup_epochs : int
+<<<<<<< HEAD
         Epochs with full teacher forcing.
     decay_epochs : int
         Epochs over which the ratio decays linearly.
+=======
+        Epochs with full teacher forcing (legacy mode).
+    decay_epochs : int
+        Epochs over which the ratio decays linearly (legacy mode).
+    num_epochs : int or None
+        Total training epochs (for linear schedule).
+    tf_min_ratio : float or None
+        Minimum TF ratio at end of training (e.g. 0.3).
+>>>>>>> feat/2d-pipeline
 
     Returns
     -------
     float
         Value in ``[0, 1]``.
     """
+<<<<<<< HEAD
+=======
+    if num_epochs is not None and tf_min_ratio is not None:
+        # Linear decay from 1.0 to tf_min_ratio over all epochs
+        if num_epochs <= 1:
+            return 1.0
+        progress = min(1.0, epoch / (num_epochs - 1))
+        return 1.0 - (1.0 - tf_min_ratio) * progress
+
+>>>>>>> feat/2d-pipeline
     if epoch < warmup_epochs:
         return 1.0
     if epoch < warmup_epochs + decay_epochs:
@@ -609,7 +787,13 @@ def train_epoch_scheduled(
     start_timestep: int = 3,
     max_timesteps: int | None = None,
     grad_clip: float = 1.0,
+<<<<<<< HEAD
 ) -> float:
+=======
+    num_epochs: int | None = None,
+    tf_min_ratio: float | None = None,
+) -> tuple[float, float]:
+>>>>>>> feat/2d-pipeline
     """Train one epoch on a single event with scheduled sampling.
 
     At each step, a coin flip (weighted by the teacher-forcing ratio)
@@ -625,18 +809,34 @@ def train_epoch_scheduled(
     optimizer : torch.optim.Optimizer
     epoch : int
     warmup_epochs, decay_epochs : int
+<<<<<<< HEAD
         Control the teacher-forcing schedule.
+=======
+        Control the teacher-forcing schedule (used if tf_min_ratio is None).
+>>>>>>> feat/2d-pipeline
     start_timestep : int
         First timestep (must be >= ``num_history`` for valid lags).
     max_timesteps : int or None
         Cap on number of training steps (``None`` → use all).
     grad_clip : float
         Max gradient norm (0 to disable).
+<<<<<<< HEAD
 
     Returns
     -------
     float
         Average loss for this epoch.
+=======
+    num_epochs : int or None
+        Total epochs (for linear TF schedule when tf_min_ratio is set).
+    tf_min_ratio : float or None
+        Min TF ratio at end of training (linear schedule over num_epochs).
+
+    Returns
+    -------
+    tuple[float, float]
+        (average loss, average gradient norm).
+>>>>>>> feat/2d-pipeline
     """
     from src.graph_builder_2d import (
         DepthHistory,
@@ -647,7 +847,16 @@ def train_epoch_scheduled(
 
     model.train()
 
+<<<<<<< HEAD
     tf_ratio = get_teacher_forcing_ratio(epoch, warmup_epochs, decay_epochs)
+=======
+    if num_epochs is not None and tf_min_ratio is not None:
+        tf_ratio = get_teacher_forcing_ratio(
+            epoch, num_epochs=num_epochs, tf_min_ratio=tf_min_ratio
+        )
+    else:
+        tf_ratio = get_teacher_forcing_ratio(epoch, warmup_epochs, decay_epochs)
+>>>>>>> feat/2d-pipeline
 
     # ── data handles ──────────────────────────────────────────────────
     static_2d = sample["static_2d_nodes"]
@@ -674,6 +883,10 @@ def train_epoch_scheduled(
 
     criterion = nn.MSELoss()
     epoch_loss = 0.0
+<<<<<<< HEAD
+=======
+    epoch_grad_norm_sum = 0.0
+>>>>>>> feat/2d-pipeline
     num_steps = 0
 
     for t in range(start_timestep, end_t):
@@ -721,12 +934,22 @@ def train_epoch_scheduled(
         optimizer.zero_grad()
         loss.backward()
 
+<<<<<<< HEAD
+=======
+        total_norm = torch.nn.utils.clip_grad_norm_(
+            model.parameters(), max_norm=float("inf")
+        )
+>>>>>>> feat/2d-pipeline
         if grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
 
         optimizer.step()
 
         epoch_loss += loss.item()
+<<<<<<< HEAD
+=======
+        epoch_grad_norm_sum += total_norm.item()
+>>>>>>> feat/2d-pipeline
         num_steps += 1
 
         # ── bookkeeping ───────────────────────────────────────────
@@ -735,7 +958,12 @@ def train_epoch_scheduled(
         depth_history.update(pred_depth_np)
         current_pred_depth = pred_depth_np
 
+<<<<<<< HEAD
     return epoch_loss / max(num_steps, 1)
+=======
+    n = max(num_steps, 1)
+    return epoch_loss / n, epoch_grad_norm_sum / n
+>>>>>>> feat/2d-pipeline
 
 
 def train_model(
@@ -753,6 +981,12 @@ def train_model(
     early_stopping_patience: int = 15,
     checkpoint_dir: str = "checkpoints",
     save_best: bool = True,
+<<<<<<< HEAD
+=======
+    lr_warmup_epochs: int = 0,
+    tf_min_ratio: float | None = None,
+    grad_clip: float = 1.0,
+>>>>>>> feat/2d-pipeline
 ) -> dict:
     """Full training loop with scheduled sampling, early stopping,
     and checkpointing.
@@ -766,9 +1000,21 @@ def train_model(
     num_epochs : int
     lr : float
     warmup_epochs, decay_epochs : int
+<<<<<<< HEAD
         Teacher-forcing schedule.
     max_timesteps_per_event : int or None
         Cap per event (useful for speed during debugging).
+=======
+        Teacher-forcing schedule (used when tf_min_ratio is None).
+    max_timesteps_per_event : int or None
+        Cap per event (useful for speed during debugging).
+    lr_warmup_epochs : int
+        Linear LR warmup: lr starts at lr/10 and ramps to lr over this many epochs (0 = no warmup).
+    tf_min_ratio : float or None
+        If set, teacher forcing decays linearly from 1.0 to this value over all epochs.
+    grad_clip : float
+        Max gradient norm for clip_grad_norm_ (0 = no clipping).
+>>>>>>> feat/2d-pipeline
     print_every, validate_every : int
         Logging intervals.
     validation_events : int
@@ -792,8 +1038,36 @@ def train_model(
 
     from src.utils_2d import compute_normalization_stats
 
+<<<<<<< HEAD
     print(f"Training on Model_{model_id}")
     print(f"Schedule: warmup={warmup_epochs}, decay={decay_epochs}")
+=======
+    # Build config dict to save in checkpoint so settings are never lost
+    training_config = {
+        "model_id": model_id,
+        "num_epochs": num_epochs,
+        "lr": lr,
+        "warmup_epochs": warmup_epochs,
+        "decay_epochs": decay_epochs,
+        "max_timesteps_per_event": max_timesteps_per_event,
+        "early_stopping_patience": early_stopping_patience,
+        "lr_warmup_epochs": lr_warmup_epochs,
+        "tf_min_ratio": tf_min_ratio,
+        "grad_clip": grad_clip,
+        "validation_events": validation_events,
+        "print_every": print_every,
+        "validate_every": validate_every,
+    }
+
+    print(f"Training on Model_{model_id}")
+    if tf_min_ratio is not None:
+        print(f"TF schedule: linear 1.0 → {tf_min_ratio} over {num_epochs} epochs")
+    else:
+        print(f"Schedule: warmup={warmup_epochs}, decay={decay_epochs}")
+    if lr_warmup_epochs > 0:
+        print(f"LR warmup: {lr_warmup_epochs} epochs (lr/10 → lr)")
+    print(f"Grad clip: {grad_clip}")
+>>>>>>> feat/2d-pipeline
     print(f"Early stopping patience: {early_stopping_patience}")
     print("-" * 60)
 
@@ -830,18 +1104,39 @@ def train_model(
     best_epoch = 0
     epochs_without_improvement = 0
     checkpoint_path = _Path(checkpoint_dir) / f"model_{model_id}_best.pt"
+<<<<<<< HEAD
+=======
+    base_lr = lr
+>>>>>>> feat/2d-pipeline
 
     t_start = time.time()
 
     for epoch in range(num_epochs):
+<<<<<<< HEAD
         # ── train ─────────────────────────────────────────────────
         model.train()
         epoch_losses: list[float] = []
+=======
+        # ── LR warmup (linear from lr/10 to lr over first lr_warmup_epochs)
+        if lr_warmup_epochs > 0 and epoch < lr_warmup_epochs:
+            warmup_factor = 0.1 + 0.9 * (epoch / lr_warmup_epochs)
+            for g in optimizer.param_groups:
+                g["lr"] = base_lr * warmup_factor
+
+        # ── train ─────────────────────────────────────────────────
+        model.train()
+        epoch_losses: list[float] = []
+        epoch_grad_norms: list[float] = []
+>>>>>>> feat/2d-pipeline
         random.shuffle(train_indices)
 
         for event_idx in train_indices:
             sample = ds_model[event_idx]
+<<<<<<< HEAD
             loss = train_epoch_scheduled(
+=======
+            loss, grad_norm = train_epoch_scheduled(
+>>>>>>> feat/2d-pipeline
                 model,
                 sample,
                 norm_stats,
@@ -850,11 +1145,29 @@ def train_model(
                 warmup_epochs=warmup_epochs,
                 decay_epochs=decay_epochs,
                 max_timesteps=max_timesteps_per_event,
+<<<<<<< HEAD
             )
             epoch_losses.append(loss)
 
         avg_train_loss = float(np.mean(epoch_losses))
         tf = get_teacher_forcing_ratio(epoch, warmup_epochs, decay_epochs)
+=======
+                grad_clip=grad_clip,
+                num_epochs=num_epochs if tf_min_ratio is not None else None,
+                tf_min_ratio=tf_min_ratio,
+            )
+            epoch_losses.append(loss)
+            epoch_grad_norms.append(grad_norm)
+
+        avg_train_loss = float(np.mean(epoch_losses))
+        avg_grad_norm = float(np.mean(epoch_grad_norms))
+        if tf_min_ratio is not None:
+            tf = get_teacher_forcing_ratio(
+                epoch, num_epochs=num_epochs, tf_min_ratio=tf_min_ratio
+            )
+        else:
+            tf = get_teacher_forcing_ratio(epoch, warmup_epochs, decay_epochs)
+>>>>>>> feat/2d-pipeline
         history["train_loss"].append(avg_train_loss)
         history["tf_ratio"].append(tf)
         history["lr"].append(optimizer.param_groups[0]["lr"])
@@ -877,9 +1190,16 @@ def train_model(
             history["val_loss"].append(avg_val_rmse**2)  # MSE
             history["val_rmse"].append(avg_val_rmse)
 
+<<<<<<< HEAD
             scheduler.step(avg_val_rmse)
 
             # ── improvement check / checkpointing ─────────────
+=======
+            if epoch >= lr_warmup_epochs:
+                scheduler.step(avg_val_rmse)
+
+        # ── improvement check / checkpointing ─────────────
+>>>>>>> feat/2d-pipeline
             if avg_val_rmse < best_val_rmse:
                 best_val_rmse = avg_val_rmse
                 best_epoch = epoch
@@ -889,6 +1209,10 @@ def train_model(
                     save_checkpoint(
                         model, optimizer, epoch,
                         avg_val_rmse, str(checkpoint_path),
+<<<<<<< HEAD
+=======
+                        config=training_config,
+>>>>>>> feat/2d-pipeline
                     )
             else:
                 epochs_without_improvement += validate_every
@@ -907,7 +1231,11 @@ def train_model(
             current_lr = optimizer.param_groups[0]["lr"]
             msg = (
                 f"Epoch {epoch:3d} | Train: {avg_train_loss:.6f} | "
+<<<<<<< HEAD
                 f"TF: {tf:.2f}"
+=======
+                f"TF: {tf:.2f} | GradNorm: {avg_grad_norm:.4f}"
+>>>>>>> feat/2d-pipeline
             )
             if history["val_rmse"]:
                 msg += f" | Val RMSE: {history['val_rmse'][-1]:.4f}"
@@ -963,6 +1291,10 @@ if __name__ == "__main__":
         num_sage_layers=2,
         dropout=0.1,
         max_delta=2.0,
+<<<<<<< HEAD
+=======
+        conv_type="sage",
+>>>>>>> feat/2d-pipeline
     )
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {total_params:,}")
@@ -1014,6 +1346,10 @@ if __name__ == "__main__":
         num_sage_layers=2,
         dropout=0.1,
         max_delta=2.0,
+<<<<<<< HEAD
+=======
+        conv_type="sage",
+>>>>>>> feat/2d-pipeline
     )
 
     load_checkpoint(model_fresh, str(checkpoint_path))
@@ -1029,4 +1365,8 @@ if __name__ == "__main__":
     diff = (pred_wl - pred_wl_fresh).abs().max().item()
     print(f"  Max diff from original: {diff:.10f} (should be ~0)")
 
+<<<<<<< HEAD
     print("\n✓ Checkpointing and early stopping working!")
+=======
+    print("\n✓ Checkpointing and early stopping working!")
+>>>>>>> feat/2d-pipeline
